@@ -1,14 +1,19 @@
 const IS_DEV = process.env.APP_VARIANT === 'development'
 
+// Fork identity: a separate app ID lets this build install alongside the official ChatterUI.
+const APP_NAME = 'ChatterUI Fork'
+const APP_ID = 'com.josetheawk.chatterui'
+const PACKAGE = IS_DEV ? `${APP_ID}.dev` : APP_ID
+
 module.exports = {
     expo: {
-        name: IS_DEV ? 'ChatterUI (DEV)' : 'ChatterUI',
+        name: IS_DEV ? `${APP_NAME} (DEV)` : APP_NAME,
         newArchEnabled: true,
         slug: 'ChatterUI',
         version: '0.10.1',
         orientation: 'default',
         icon: './assets/images/icon.png',
-        scheme: 'chatterui',
+        scheme: 'chatterui-fork',
         userInterfaceStyle: 'automatic',
         assetBundlePatterns: ['**/*'],
         ios: {
@@ -18,8 +23,8 @@ module.exports = {
                 tinted: './assets/images/icon.png',
             },
             supportsTablet: true,
-            package: IS_DEV ? 'com.Vali98.ChatterUIDev' : 'com.Vali98.ChatterUI',
-            bundleIdentifier: IS_DEV ? 'com.Vali98.ChatterUIDev' : 'com.Vali98.ChatterUI',
+            package: PACKAGE,
+            bundleIdentifier: PACKAGE,
         },
         android: {
             adaptiveIcon: {
@@ -28,7 +33,7 @@ module.exports = {
                 monochromeImage: './assets/images/adaptive-icon-foreground.png',
                 backgroundColor: '#000',
             },
-            package: IS_DEV ? 'com.Vali98.ChatterUIDev' : 'com.Vali98.ChatterUI',
+            package: PACKAGE,
             userInterfaceStyle: 'dark',
             permissions: [
                 'android.permission.FOREGROUND_SERVICE',
@@ -81,7 +86,7 @@ module.exports = {
                     'android:largeHeap': true,
                 },
             ],
-            ['@vali98/react-native-process-text', { label: 'Ask In ChatterUi' }],
+            ['@vali98/react-native-process-text', { label: `Ask In ${APP_NAME}` }],
             [
                 'expo-camera',
                 {
