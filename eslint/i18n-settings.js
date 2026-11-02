@@ -279,6 +279,11 @@ module.exports = {
             'height',
             'name',
             'ios_backgroundColor',
+            'next',
+            'previous',
+            'icon',
+            'iconName',
+            'variant',
         ],
     },
     words: {
@@ -305,6 +310,7 @@ module.exports = {
             'flex-end',
             'flex-start',
             /\b\d+(?:deg|rad)\b/g,
+            'worklet',
         ],
     },
     callees: {
@@ -337,6 +343,7 @@ module.exports = {
             'flexDirection',
             'textAlign',
             'borderColor',
+            'key',
         ],
     },
     'class-properties': {

@@ -1,192 +1,318 @@
 import { t } from 'i18next'
-import BackgroundService from 'react-native-background-actions'
 
 import { ChatSwipe } from '@db/schema'
-import { AppSettings } from '@lib/constants/GlobalValues'
-import { isCloseThinkTag, isOpenThinkTag } from '@lib/markdown/ThinkTags'
 import { useAppModeStore } from '@lib/state/AppMode'
-import { Chats, useInference } from '@lib/state/Chat'
-import { Instructs } from '@lib/state/Instructs'
-import { SamplersManager } from '@lib/state/SamplerState'
-import { useTTSStore } from '@lib/state/TTS'
-import { mmkv } from '@lib/storage/MMKV'
+import { Chats } from '@lib/state/chat'
+import { summaryList } from '@lib/summaries/db'
+import { useSummarySettingsStore } from '@lib/summaries/settingsStore'
 
-import { Characters } from '../state/Characters'
 import { Logger } from '../state/Logger'
-import { APIBuilderParams, buildAndSendRequest } from './API/APIBuilder'
-import { APIConfiguration, APIValues } from './API/APIBuilder.types'
-import { APIManager } from './API/APIManagerState'
-import { getDataSources } from './DataSources'
-import { localInference } from './LocalInference'
-import { Tokenizer } from './Tokenizer'
+import { APIBuilderParams, buildAndSendRequest, CompletionReason } from './API/APIBuilder'
+import {
+    captureGenerationInputs,
+    generationContextLimit,
+    prepareGenerationContext,
+    type GenerationInputs,
+} from './generation/inputs'
+import { finishGeneration } from './generation/lifecycle'
+import { beginGeneration as reserveGeneration, getGenerationRuntime } from './generation/runtime'
+import { scheduleDeferredTask } from './generation/scheduler'
+import { runGenerationTask } from './generation/service'
+import {
+    appendGeneration,
+    enableGenerationInlineReasoning,
+    attachGenerationSwipe,
+    isActiveGeneration,
+    updateGeneration,
+    useGenerationState,
+} from './generation/state'
+import { localInference, verifyModelLoaded } from './LocalInference'
+import { captureHistory } from './generation/history'
+import { prepareAutomaticSummary } from './summaries/actions'
 
-export async function regenerateResponse(swipe: ChatSwipe, regenCache: boolean = true) {
-    Logger.info('Regenerate Response' + (regenCache ? '' : ' , Resetting Message'))
-
-    let replacement = ''
-    if (regenCache)
-        replacement = swipe.reset_length ? swipe.swipe.substring(0, swipe.reset_length) : ''
-
-    Chats.useChatState.getState().setBuffer({ data: replacement })
-    await Chats.db.mutate.updateChatSwipe(swipe.id, replacement, {
-        updateFinished: true,
-        updateStarted: true,
-        resetTimings: true,
+const beginGeneration = (swipeId: number, text = '', reasoning = '') => {
+    const context = Chats.db.query.swipeContext(swipeId)
+    if (!context) return
+    const mode = useAppModeStore.getState().appMode
+    const generation = reserveGeneration({
+        chatId: context.chat_id,
+        swipeId: swipeId,
+        mode: mode,
+        text: text,
+        reasoning: reasoning,
     })
-
-    await generateResponse(swipe.id)
-}
-
-export async function continueResponse(swipe: ChatSwipe) {
-    Logger.info(`Continuing Response`)
-    await Chats.db.mutate.updateSwipeResetLength(swipe.id, swipe.swipe.length)
-    Chats.useChatState.getState().insertToBuffer(swipe.swipe)
-    await generateResponse(swipe.id)
-}
-
-const completionTaskOptions = {
-    taskName: 'chatterui_completion_task',
-    taskTitle: 'Running completion...',
-    taskDesc: 'ChatterUI is running a completion task',
-    taskIcon: {
-        name: 'ic_launcher',
-        type: 'mipmap',
-    },
-    color: '#403737',
-    linkingURI: 'chatterui://',
-    progressBar: {
-        max: 1,
-        value: 0,
-        indeterminate: true,
-    },
-}
-
-export async function generateResponse(swipeId: number) {
-    if (useInference.getState().nowGenerating) {
+    if (!generation) {
         Logger.infoToast(t('generation.errors.generationAlreadyInProgress'))
         return
     }
-    useInference.getState().startGenerating(swipeId)
-    Logger.info(`Obtaining response.`)
-    const appMode = useAppModeStore.getState().appMode
+    try {
+        getGenerationRuntime(generation.id).originalSwipe = Chats.db.query.swipe(swipeId)
+        const inputs = captureGenerationInputs(context.chat_id, mode)
+        inputs.messages = inputs.messages.map((message) => ({
+            ...message,
+            swipes: message.swipes.map((swipe) =>
+                swipe.id === swipeId
+                    ? {
+                          ...swipe,
+                          swipe: text,
+                          token_length: null,
+                          reasoning: reasoning
+                              ? { swipe_id: swipeId, content: reasoning, reset_length: null }
+                              : null,
+                      }
+                    : swipe
+            ),
+        }))
+        getGenerationRuntime(generation.id).inputs = inputs
+    } catch (error) {
+        Logger.errorToast(t('generation.errors.failedToOrchestrateRequestBuild'), error)
+        void finishGeneration(generation.id, 'failed').catch(Logger.stackTrace)
+        return
+    }
+    return generation.id
+}
 
-    if (appMode === 'local') {
-        await BackgroundService.start(localInference, completionTaskOptions)
-    } else {
-        await BackgroundService.start(chatInferenceStream, completionTaskOptions)
+// Reserve before attachment/database awaits, so repeated UI inputs cannot create competing turns.
+export type SubmitMessageInput = { text: string; attachmentUris?: string[] }
+
+export async function submitMessage(chatId: number, input: SubmitMessageInput) {
+    const mode = useAppModeStore.getState().appMode
+    const generation = reserveGeneration({ chatId: chatId, swipeId: -1, mode: mode, text: '' })
+    if (!generation) return false
+    try {
+        const inputs = captureGenerationInputs(chatId, mode)
+        await runGenerationTask(async () => {
+            const runtime = getGenerationRuntime(generation.id)
+            const message = await Chats.actions.createTurn(
+                chatId,
+                {
+                    userName: inputs.user.name,
+                    characterName: inputs.character.name,
+                    text: input.text,
+                    attachmentUris: input.attachmentUris,
+                },
+                {
+                    signal: runtime.controller.signal,
+                    macros: inputs.macros,
+                    mutationToken: runtime.mutationToken,
+                }
+            )
+            const swipe = message.swipes.find((item) => item.active)
+            if (!swipe) throw new Error('New response has no active swipe')
+            attachGenerationSwipe(generation.id, swipe.id)
+            const captured = captureHistory(chatId, inputs.includeReasoning)
+            inputs.messages = captured.messages
+            inputs.history = captured.history
+            getGenerationRuntime(generation.id).inputs = inputs
+            void startGenerationTask(generation.id).catch(Logger.stackTrace)
+        })
+        return true
+    } catch (error) {
+        const cancelled = getGenerationRuntime(generation.id).controller.signal.aborted
+        if (!cancelled) Logger.errorToast(t('chat.input.errors.failedToSend'), error)
+        await finishGeneration(generation.id, cancelled ? 'cancelled' : 'failed').catch(
+            Logger.stackTrace
+        )
+        return false
     }
 }
-// TODO: Use this
-/*
-const useGenerateResponse = () => {
-    const startGenerating = Chats.useChatState((state) => state.startGenerating)
-    const nowGenerating = useInference((state) => state.nowGenerating)
-    const appMode = useAppModeStore((state) => state.appMode)
 
-    const generateResponse = useCallback(
-        async (swipeId: number) => {
-            if (nowGenerating) {
-                Logger.infoToast(t('generation.errors.generationAlreadyInProgress'))
-                return
-            }
-            startGenerating(swipeId)
-            Logger.info(`Obtaining response.`)
-            const process = appMode === 'local' ? localInference : chatInferenceStream
-            await BackgroundService.start(process, completionTaskOptions)
-        },
-        [nowGenerating, appMode, startGenerating]
+export async function regenerateResponse(swipe: ChatSwipe, regenCache = true) {
+    const resetLength = regenCache ? swipe.reset_length : null
+    const hasCheckpoint = typeof resetLength === 'number'
+    const replacement = hasCheckpoint ? swipe.swipe.slice(0, resetLength) : ''
+    const reasoning = Chats.db.query.reasoning(swipe.id)
+    const generationId = beginGeneration(
+        swipe.id,
+        replacement,
+        hasCheckpoint ? (reasoning?.content.slice(0, reasoning.reset_length ?? 0) ?? '') : ''
     )
+    if (generationId === undefined) return
+    try {
+        getGenerationRuntime(generationId).swipeChanges = {
+            startedAt: new Date(),
+            resetTimings: true,
+            resetLength: hasCheckpoint ? resetLength : null,
+            resetReasoningLength: hasCheckpoint ? (reasoning?.reset_length ?? null) : null,
+        }
+        await startGenerationTask(generationId)
+    } catch (error) {
+        Logger.errorToast(t('generation.errors.completionFailed'), error)
+        await finishGeneration(generationId, 'failed')
+    }
+}
 
-    return generateResponse
-}*/
+export async function continueResponse(swipe: ChatSwipe) {
+    const reasoning = Chats.db.query.reasoning(swipe.id)?.content ?? ''
+    const generationId = beginGeneration(swipe.id, swipe.swipe, reasoning)
+    if (generationId === undefined) return
+    try {
+        getGenerationRuntime(generationId).swipeChanges = {
+            resetLength: swipe.swipe.length,
+            resetReasoningLength: reasoning.length,
+        }
+        await startGenerationTask(generationId)
+    } catch (error) {
+        Logger.errorToast(t('generation.errors.completionFailed'), error)
+        await finishGeneration(generationId, 'failed')
+    }
+}
 
-async function chatInferenceStream() {
-    const fields = await obtainFields()
-    const stop = () => useInference.getState().stopGenerating()
+export async function generateResponse(swipeId: number) {
+    const generationId = beginGeneration(swipeId)
+    if (generationId !== undefined) await startGenerationTask(generationId)
+}
+
+const startGenerationTask = async (generationId: number) => {
+    if (!isGenerationActive(generationId)) return
+    const inputs = getGenerationRuntime(generationId).inputs
+    if (!inputs) return
+    try {
+        await runGenerationTask(async () => {
+            try {
+                const controller = getGenerationRuntime(generationId).controller
+                const summarySettings = useSummarySettingsStore.getState()
+                if (summarySettings.enabled && summarySettings.autoGenerate) {
+                    if (inputs.mode === 'local') {
+                        if (!(await verifyModelLoaded(inputs, generationId))) {
+                            await finishGeneration(generationId, 'failed')
+                            return
+                        }
+                        inputs.activateLocalTokenizer()
+                    }
+                    try {
+                        const summary = await prepareAutomaticSummary(inputs, {
+                            parentGenerationId: generationId,
+                            signal: controller.signal,
+                        })
+                        if (summary) {
+                            updateGeneration(generationId, { status: 'summarizing' })
+                            const cancelSummary = () => summary.cancel()
+                            controller.signal.addEventListener('abort', cancelSummary)
+                            if (controller.signal.aborted) cancelSummary()
+                            try {
+                                await summary.done
+                            } finally {
+                                controller.signal.removeEventListener('abort', cancelSummary)
+                            }
+                        }
+                    } catch (error) {
+                        Logger.stackTrace(error)
+                    }
+                    inputs.summaries = summaryList(inputs.chatId).all()
+                    updateGeneration(generationId, { status: 'preparing' })
+                }
+                if (controller.signal.aborted) {
+                    await finishGeneration(generationId, 'cancelled')
+                    return
+                }
+                if (inputs.mode === 'local') await localInference(generationId, inputs)
+                else await chatInferenceStream(generationId, inputs)
+            } catch (error) {
+                Logger.errorToast(t('generation.errors.completionFailed'), error)
+                await finishGeneration(generationId, 'failed').catch(Logger.stackTrace)
+            }
+        })
+    } catch (error) {
+        Logger.errorToast(t('generation.errors.completionFailed'), error)
+        await finishGeneration(generationId, 'failed')
+    }
+}
+
+const isGenerationActive = (generationId: number) => {
+    const generation = useGenerationState.getState().generations[generationId]
+    return !!generation && isActiveGeneration(generation)
+}
+
+async function chatInferenceStream(generationId: number, inputs: GenerationInputs) {
+    if (!isGenerationActive(generationId)) return
+    const { chatId } = inputs
+    const stop = async (reason: CompletionReason) => {
+        const output = useGenerationState.getState().generations[generationId]
+        const titleInputs = {
+            ...inputs,
+            messages: inputs.messages.map((message) => ({
+                ...message,
+                swipes: message.swipes.map((swipe) =>
+                    swipe.id === output?.swipeId ? { ...swipe, swipe: output.text } : swipe
+                ),
+            })),
+        }
+        await finishGeneration(generationId, reason)
+        if (
+            reason === 'completed' &&
+            output?.receivedOutput &&
+            output.text.trim() &&
+            !controller.signal.aborted &&
+            inputs.autoTitle &&
+            Chats.db.query.chatName(chatId) === 'New Chat'
+        ) {
+            scheduleDeferredTask(chatId, (signal) => titleGeneratorStream(titleInputs, signal), {
+                mode: 'remote',
+                kind: 'title',
+            })
+        }
+    }
+    const onData: APIBuilderParams['onData'] = (output) => {
+        if (!isGenerationActive(generationId) || output.type === 'tool_call') return
+        appendGeneration(generationId, output.content, output.type)
+    }
+
+    const { controller } = getGenerationRuntime(generationId)
+    const { ready } = obtainFields(inputs, {
+        controller: controller,
+        onData: onData,
+        stopGenerating: stop,
+    })
+    const fields = await ready
+    if (controller.signal.aborted || !isGenerationActive(generationId)) {
+        await stop('cancelled')
+        return
+    }
     if (!fields) {
         Logger.error('Chat Inference Failed')
-        stop()
+        await stop('failed')
         return
     }
-    fields.stopGenerating = stop
-    let reasoningMode: 'structured' | 'raw' | null = null
-    fields.onData = (output) => {
-        if (!reasoningMode && output.type === 'reasoning') {
-            Chats.useChatState.getState().insertToBuffer('<think>')
-            reasoningMode = 'raw'
-        }
-
-        if (reasoningMode === 'raw' && output.type !== 'reasoning' && reasoningMode === 'raw') {
-            Chats.useChatState.getState().insertToBuffer('</think>\n')
-            reasoningMode = null
-        }
-
-        /**
-         * This is a naive implementation that expects output tags to be full tokens
-         * Most LLMs are trained so that think_start and think_end tokens are not composite
-         */
-        if (!reasoningMode && output.type === 'text' && isOpenThinkTag(output.type)) {
-            reasoningMode = 'structured'
-        }
-
-        if (
-            reasoningMode === 'structured' &&
-            output.type === 'text' &&
-            isCloseThinkTag(output.type)
-        ) {
-            reasoningMode = null
-        }
-
-        Chats.useChatState.getState().insertToBuffer(output.content)
-
-        /**
-         * considerations
-         * - add tool calls
-         */
-        if (!reasoningMode) useTTSStore.getState().insertBuffer(output.content)
-    }
-
-    fields.onEnd = async () => {
-        const chatId = Chats.useChatState.getState().id
-        if (!chatId) return
-        const chatName = await Chats.db.query.chatName(chatId)
-        if (!mmkv.getBoolean(AppSettings.AutoGenerateTitle) || chatName !== 'New Chat') return
-        Logger.info('Generating Title')
-        titleGeneratorStream(chatId)
-    }
-    const abort = await buildAndSendRequest(fields)
-    useInference.getState().setAbort(() => {
-        Logger.debug('Running Abort')
-        abort?.()
-    })
+    if (
+        fields.apiConfig.request.completionType.type === 'textCompletions' ||
+        !fields.apiConfig.request.reasoningParsePattern?.length
+    )
+        enableGenerationInlineReasoning(generationId)
+    updateGeneration(generationId, { status: 'running' })
+    const request = buildAndSendRequest(fields)
+    await request.done
 }
 
-const titleGeneratorStream = async (chatId: number) => {
-    const fields = await obtainFields()
-    if (!fields) {
-        Logger.error('Title Generation Failed')
-        return
-    }
-    fields.samplers.genamt = 50
-    fields.samplers.reasoning_max_tokens = 0
-    fields.samplers.reasoning_effort = 'low'
-    fields.samplers.reasoning_exclude = true
+const titleGeneratorStream = async (inputs: GenerationInputs, signal: AbortSignal) => {
+    const { chatId } = inputs
+    if (Chats.db.query.chatName(chatId) !== 'New Chat') return
     let titleOutput = ''
-    fields.onData = (output) => {
-        if (output.type === 'text') titleOutput += output.content
-    }
-
-    fields.onEnd = () => {
-        Logger.debug('Autogenerated Name: ' + titleOutput)
-        if (titleOutput)
-            Chats.db.mutate.renameChat(
-                chatId,
-                titleOutput
-                    .trim()
-                    .replace(/["'.*]/g, '')
-                    .replace(/\b\w/g, (char) => char.toUpperCase())
-            )
-        else Logger.warn('Autogenerated name was blank.')
+    const completion: { reason: CompletionReason } = { reason: 'failed' }
+    const { ready } = obtainFields(inputs, {
+        signal: signal,
+        recordStats: false,
+        stopGenerating: (reason) => {
+            completion.reason = reason
+        },
+        onData: (output) => {
+            if (output.type === 'text') titleOutput += output.content
+        },
+        onEnd: () => {
+            const title = titleOutput
+                .trim()
+                .replace(/["'.*]/g, '')
+                .replace(/\b\w/g, (char) => char.toUpperCase())
+                .trim()
+            if (!title) throw new Error('Generated title was blank')
+            Logger.debug('Autogenerated Name: ' + title)
+            if (Chats.db.query.chatName(chatId) === 'New Chat')
+                Chats.db.update.chat(chatId, { name: title })
+        },
+    })
+    const fields = await ready
+    if (!fields) {
+        throw new Error('Title preparation failed')
     }
     const entry = {
         id: -1,
@@ -213,120 +339,45 @@ const titleGeneratorStream = async (chatId: number) => {
     }
     fields.messages.push(entry)
 
-    await buildAndSendRequest(fields)
+    const request = buildAndSendRequest(fields)
+    await request.done
+    if (completion.reason !== 'completed') throw new Error(`Title generation ${completion.reason}`)
 }
 
-const getModelContextLength = (config: APIConfiguration, values: APIValues): number | undefined => {
-    const keys = config.model.contextSizeParser.split('.')
-    const result = keys.reduce((acc, key) => acc?.[key], values.model)
-    return Number.isInteger(result) ? result : undefined
+type ObtainFieldsOptions = Pick<APIBuilderParams, 'onData' | 'onEnd' | 'stopGenerating'> & {
+    controller?: AbortController
+    signal?: AbortSignal
+    recordStats?: boolean
 }
 
-// This is the 'big orchestrator' which compiles fields from
-// the whole app to send inference requests
-async function obtainFields(): Promise<APIBuilderParams | void> {
-    try {
-        const userState = Characters.useUserStore.getState()
-        const characterState = Characters.useCharacterStore.getState()
-        const apiState = APIManager.useConnectionsStore.getState()
-        const instructState = Instructs.useInstruct.getState()
-
-        const userCard = userState.card
-        if (!userCard) {
-            Logger.errorToast(t('generation.errors.noUser'))
-            return
+function obtainFields(inputs: GenerationInputs, options: ObtainFieldsOptions) {
+    const {
+        controller = new AbortController(),
+        signal = controller.signal,
+        recordStats = true,
+        ...handlers
+    } = options
+    const ready = (async (): Promise<APIBuilderParams | void> => {
+        try {
+            const apiConfig = inputs.apiConfig
+            const apiValues = inputs.apiValues
+            if (!apiConfig || !apiValues) return
+            const samplers = { ...inputs.samplers }
+            const length = Math.max(0, generationContextLimit(inputs) - samplers.genamt)
+            const context = await prepareGenerationContext(inputs, { recordStats })
+            return {
+                ...context,
+                ...handlers,
+                signal: signal,
+                apiConfig: apiConfig,
+                apiValues: apiValues,
+                samplers: samplers,
+                stopSequence: [...inputs.stopSequence],
+                maxLength: length,
+            }
+        } catch (error) {
+            Logger.errorToast(t('generation.errors.failedToOrchestrateRequestBuild'), error)
         }
-
-        const characterCard = characterState.card
-        if (!characterCard) {
-            Logger.errorToast(t('generation.errors.noCharacter'))
-            return
-        }
-
-        const chatId = Chats.useChatState.getState().id
-        if (!chatId) {
-            Logger.errorToast(t('generation.errors.noActiveChat'))
-            return
-        }
-
-        const messages = (await Chats.db.query.chat(chatId))?.messages
-        if (!messages) {
-            Logger.errorToast(t('generation.errors.noChatFound'))
-            return
-        }
-
-        const apiValues = apiState.values.find((item, index) => index === apiState.activeIndex)
-        if (!apiValues) {
-            Logger.warnToast(t('generation.errors.noActiveAPI'))
-            return
-        }
-
-        const configs = apiState.getTemplates().filter((item) => item.name === apiValues.configName)
-
-        const apiConfig = configs[0]
-        if (!apiConfig) {
-            Logger.errorToast(
-                t('generation.errors.configurationNotFound', { name: apiValues?.configName })
-            )
-            return
-        }
-        const samplers = SamplersManager.getCurrentSampler()
-        const modelLengthField = getModelContextLength(apiConfig, apiValues)
-        const instructLength = samplers.max_length as number
-        const modelLength = modelLengthField ?? (instructLength as number)
-        const length = apiConfig.model.useModelContextLength
-            ? Math.min(modelLength, instructLength)
-            : instructLength - (samplers.genamt as number)
-
-        let stopSequence = instructState.getStopSequence()
-        const stopSequenceLimit = apiConfig.request.stopSequenceLimit
-        if (stopSequenceLimit && stopSequence?.length > stopSequenceLimit) {
-            stopSequence = stopSequence.slice(0, stopSequenceLimit)
-            Logger.warn('Stop sequence length exceeds defined stopSequenceLimit')
-        }
-        const tokenizer = Tokenizer.getTokenizer()
-
-        const dataSources = await getDataSources()
-
-        return {
-            apiConfig: Object.assign({}, apiConfig),
-            apiValues: Object.assign({}, apiValues),
-            onData: () => {},
-            onEnd: () => {},
-            instruct: instructState.replacedMacros(),
-            samplers: Object.assign({}, samplers),
-            character: Object.assign({}, characterCard),
-            user: Object.assign({}, userCard),
-            messages: [...messages],
-            stopSequence: stopSequence,
-            stopGenerating: () => {},
-            chatTokenizer: async (entry, index) => {
-                // IMPORTANT - we use -1 for dummy entries
-                if (entry.id === -1) return 0
-                const [activeSwipe] = entry.swipes.filter((item) => item.active)
-                if (!activeSwipe) return 0
-                const tokenCount = activeSwipe.token_count ?? 0
-                if (tokenCount === 0 && activeSwipe.swipe.length > 0) {
-                    // assume that token length hasnt been calculated
-                    const tokenCount = await tokenizer(
-                        activeSwipe.swipe,
-                        entry.attachments.map((item) => item.uri)
-                    )
-                    await Chats.db.mutate.updateSwipeTokenLength(activeSwipe.id, tokenCount)
-                }
-                return activeSwipe.token_count ?? 0
-            },
-            tokenizer: tokenizer,
-            maxLength: length,
-            cache: {
-                userCache: await userState.getCache(characterCard.name),
-                characterCache: await characterState.getCache(userCard.name),
-                instructCache: await instructState.getCache(characterCard.name, userCard.name),
-            },
-            dataSources: dataSources,
-        }
-    } catch (e) {
-        Logger.stackTrace(e)
-        Logger.errorToast(t('generation.errors.failedToOrchestrateRequestBuild'), e)
-    }
+    })()
+    return { controller, ready }
 }

@@ -9,8 +9,8 @@ import { persist } from 'zustand/middleware'
 
 import { db } from '@db/db'
 import { model_data, model_mmproj_links, ModelDataType } from '@db/schema'
-import { Storage } from '@lib/enums/Storage'
-import { CharacterLink } from '@lib/state/CharacterLinks'
+import { Storage } from '@lib/constants/storageKeys'
+import { CharacterLinks } from '@lib/state/characters/links'
 import { Logger } from '@lib/state/Logger'
 import { createMMKVStorage } from '@lib/storage/MMKV'
 import {
@@ -27,15 +27,8 @@ import {
 import { GGMLNameMap, GGMLType } from './GGML'
 
 export type ModelData = Omit<ModelDataType, 'id' | 'create_date' | 'last_modified'>
-export type ModelListQueryType = Omit<
-    Awaited<ReturnType<typeof Model.getModelListQuery2>>[0],
-    'mmprojLink'
-> & {
-    mmprojLink?: {
-        model_id: number
-        mmproj_id: number
-    }
-}
+export type ModelListQueryType = Awaited<ReturnType<typeof Model.getModelListQuery>>[0]
+
 const mmprojArchs = ['clip', 'llava']
 
 export namespace Model {
@@ -50,7 +43,7 @@ export namespace Model {
         if (modelInfo.file_path.startsWith(AppDirectory.ModelPath))
             await deleteModelFile(modelInfo.file)
         await db.delete(model_data).where(eq(model_data.id, id))
-        await CharacterLink.db.mutate.deleteByValue('model_id', id)
+        await CharacterLinks.db.delete.linksByTarget({ type: 'model_id', value: id })
     }
 
     export const isMMPROJ = (arch: string) => {
@@ -112,6 +105,19 @@ export namespace Model {
         })
     }
 
+    export const getModel = async (modelId: number) => {
+        const result = await db.query.model_data.findFirst({ where: eq(model_data.id, modelId) })
+        return result
+    }
+
+    export const getModelWithMMProj = async (modelId: number) => {
+        const result = await db.query.model_data.findFirst({
+            where: eq(model_data.id, modelId),
+            with: { mmprojLink: true },
+        })
+        return result
+    }
+
     export const getModelExists = (path: string) => {
         return fileExists(path)
     }
@@ -162,10 +168,6 @@ export namespace Model {
     }
 
     export const getModelListQuery = () => {
-        return db.query.model_data.findMany()
-    }
-
-    export const getModelListQuery2 = () => {
         return db.query.model_data.findMany({
             where: notInArray(model_data.architecture, mmprojArchs),
             with: {
@@ -189,7 +191,7 @@ export namespace Model {
 
     export const createMMPROJLink = async (
         model: ModelListQueryType,
-        mmproj: ModelListQueryType
+        mmproj: Omit<ModelListQueryType, 'mmprojLink'>
     ) => {
         await db.insert(model_mmproj_links).values({ model_id: model.id, mmproj_id: mmproj.id })
     }

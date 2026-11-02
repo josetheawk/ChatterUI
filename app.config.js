@@ -10,7 +10,7 @@ module.exports = {
         name: IS_DEV ? `${APP_NAME} (DEV)` : APP_NAME,
         newArchEnabled: true,
         slug: 'ChatterUI',
-        version: '0.10.1',
+        version: '0.11.0-beta1',
         orientation: 'default',
         icon: './assets/images/icon.png',
         scheme: 'chatterui-fork',
@@ -106,6 +106,14 @@ module.exports = {
                             cropToolbarColor: '#000000',
                         },
                     },
+                },
+            ],
+            [
+                'expo-audio',
+                {
+                    enableBackgroundPlayback: true,
+                    recordAudioAndroid: true,
+                    microphonePermission: 'Allow ChatterUI to access your microphone',
                 },
             ],
             'expo-localization',

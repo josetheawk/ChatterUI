@@ -1,29 +1,29 @@
 import { t } from 'i18next'
 
-import { AppSettings } from '@lib/constants/GlobalValues'
-import { buildThinkRules } from '@lib/markdown/ThinkTags'
+import { AppSettings } from '@lib/constants/appSettings'
+import { CONTINUATION_PROMPT_KEY, DEFAULT_CONTINUATION_PROMPT } from '@lib/constants/generation'
+import { useTextFilterStore } from '@lib/hooks/TextFilter'
 import { useAppModeStore } from '@lib/state/AppMode'
-import { CharacterCardData, CharacterTokenCache } from '@lib/state/Characters'
-import { ChatEntry } from '@lib/state/Chat'
+import { CharacterCard, CharacterTokenCounts } from '@lib/state/characters'
+import { ChatMessage } from '@lib/state/chat'
 import { defaultSystemPromptFormat, InstructTokenCache, InstructType } from '@lib/state/Instructs'
 import { Logger } from '@lib/state/Logger'
-import { replaceMacros } from '@lib/state/Macros'
+import { getActiveMacros, replaceMacros } from '@lib/state/Macros'
 import { mmkv } from '@lib/storage/MMKV'
 import { readBase64Async } from '@lib/utils/File'
-import { Macro } from '@lib/utils/Macros'
+import { applyMacros, type MacroValues } from '@lib/utils/Macros'
 
 import { APIConfiguration, APIValues } from './APIBuilder.types'
 import type { DataSource, DataSourceResult } from '../DataSources/types'
+import type { ContextStats } from '../generation/contextStatsState'
 
 export type MessageLoader = {
-    retrieve: (page: number) => Promise<ChatEntry[]> // must retrieve messages in chronological order from oldest to newest
-    pageSize: number // we use this to determine if a last page has been reached, if (await retrieve()).length < pageSize
-    initialPage: number // usually 0
+    loadOlder: (remainingTokens: number) => Promise<ChatMessage[]> // chronological order within each older batch
 }
 
 export type TokenCache = {
-    userCache: CharacterTokenCache
-    characterCache: CharacterTokenCache
+    userCounts: CharacterTokenCounts
+    characterCounts: CharacterTokenCounts
     instructCache: InstructTokenCache
 }
 
@@ -34,16 +34,21 @@ const printContext = (context: string) => {
 }
 
 export interface ContextBuilderParams {
+    onContextStats?: (stats: ContextStats) => void
+    summaryTokens?: Record<number, { summarizedMessages: number; rawHistory: number }>
+    macros?: MacroValues
+    textFilter?: Pick<ReturnType<typeof useTextFilterStore.getState>, 'sendFilteredText' | 'filter'>
     apiConfig: APIConfiguration
     apiValues: APIValues
-    messages: ChatEntry[]
-    character: CharacterCardData
+    messages: ChatMessage[]
+    character: CharacterCard
     instruct: InstructType
-    user: CharacterCardData
+    user: CharacterCard
     tokenizer: (data: string, media_paths?: string[]) => Promise<number> | number
-    chatTokenizer: (entry: ChatEntry, index: number) => Promise<number>
+    chatTokenizer: (entry: ChatMessage, index: number) => Promise<number>
     maxLength: number
     cache: TokenCache
+    includeInlineReasoning?: boolean
     bypassContextLength?: boolean
     messageLoader?: MessageLoader
     dataSources?: DataSource[]
@@ -73,10 +78,7 @@ export type ContextMessage = {
 }
 
 export type CompletionState =
-    | 'initial_truncated'
-    | 'initial_completed'
-    | 'loader_completed'
-    | 'loader_truncated'
+    'initial_truncated' | 'initial_completed' | 'loader_completed' | 'loader_truncated'
 
 export const collectContext = async (params: ContextBuilderParams & { mode: 'chat' | 'text' }) => {
     const {
@@ -97,7 +99,7 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
 
     const delta = performance.now()
 
-    const { characterCache, userCache, instructCache } = cache
+    const { characterCounts, userCounts, instructCache } = cache
 
     const usePrefix = mode === 'text'
     const useSuffix = false
@@ -105,19 +107,32 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
     const sortedDataSources = [...(dataSources ?? [])].sort((a, b) => a.priority - b.priority)
 
     let { systemPrompt, systemPromptLength } = getSystemPrompt({
-        instruct,
-        user,
-        character,
-        userCache,
-        characterCache,
-        instructCache,
-        usePrefix,
-        useSuffix,
+        instruct: instruct,
+        user: user,
+        character: character,
+        userCounts: userCounts,
+        characterCounts: characterCounts,
+        instructCache: instructCache,
+        usePrefix: usePrefix,
+        useSuffix: useSuffix,
+        macroValues: params.macros,
     })
+
+    systemPromptLength = await tokenizer(
+        filterContextText(systemPrompt, instruct, params.textFilter)
+    )
+    if (mode === 'text') systemPromptLength += await tokenizer(instruct.system_suffix ?? '')
+    if (systemPromptLength > maxLength && !bypassContextLength)
+        Logger.warnToast(t('generation.warn.systemPromptExceedsContext'))
 
     const reservedBudget = sortedDataSources.reduce((acc, curr) => acc + curr.tokenBudget, 0)
 
     let totalLength = systemPromptLength + reservedBudget
+    let historyTokens = 0
+    let summaryTokens = 0
+    let summarizedMessages = 0
+    let rawSummaryTokens = 0
+    let dataSourceTokens = 0
 
     let hasImage = false
     let completionState: CompletionState = 'initial_completed'
@@ -128,47 +143,54 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
      * Shared processor
      */
     const processMessage = async (
-        message: ChatEntry,
+        message: ChatMessage,
         index: number,
         isLast: boolean
     ): Promise<boolean> => {
-        const swipe = message.swipes[0]
+        const swipe = message.swipes.find((item) => item.active)
         if (!swipe) {
             Logger.errorToast(t('generation.warn.entryWithoutValidSwipeFound'))
             return false
         }
+        const timestamp =
+            message.id >= 0 && instruct.timestamp
+                ? `[${swipe.send_date.toDateString()} ${swipe.send_date.toLocaleTimeString()}]\n`
+                : ''
+        const name = message.id >= 0 && instruct.names ? `${message.name}: ` : ''
+        const role: 'user' | 'assistant' = message.is_user ? 'user' : 'assistant'
+        // TODO: Native reasoning replay belongs to explicit provider/template capabilities.
+        const reasoning =
+            (mode === 'text' || params.includeInlineReasoning) &&
+            !instruct.hide_think_tags &&
+            swipe.reasoning?.content
+                ? `<think>${swipe.reasoning.content}</think>\n`
+                : ''
+        if (!swipe.swipe && !reasoning && isLast) return true
+        const content = filterContextText(
+            replaceMacros(`${timestamp}${name}${reasoning}${swipe.swipe}`, params.macros),
+            instruct,
+            params.textFilter
+        )
         const swipeLen = await chatTokenizer(message, index)
-
-        const timestamp = instruct.timestamp
-            ? `[${swipe.send_date.toDateString()} ${swipe.send_date.toLocaleTimeString()}]\n`
-            : ''
-
-        const name = instruct.names ? `${message.name}: ` : ''
-
-        const timestampLen = instruct.timestamp ? await tokenizer(timestamp) : 0
-        const nameLen = instruct.names ? await tokenizer(name) : 0
-
+        const contentLength =
+            content === swipe.swipe
+                ? swipeLen
+                : await tokenizer(
+                      content,
+                      message.attachments
+                          .filter((item) => item.type === 'image')
+                          .map((item) => item.uri)
+                  )
         let instructLen = 0
         if (mode === 'text') {
-            instructLen += message.is_user
-                ? instructCache.input_prefix_length
-                : instructCache.output_prefix_length
+            instructLen = message.is_user
+                ? instructCache.input_prefix_length + instructCache.input_suffix_length
+                : isLast
+                  ? instructCache.last_output_prefix_length
+                  : instructCache.output_prefix_length + instructCache.output_suffix_length
         }
-
-        const shardLen = swipeLen + timestampLen + nameLen + instructLen
-
-        // HARD LIMIT (always enforced)
-        if (totalLength + shardLen > maxLength && !bypassContextLength) {
-            return false
-        }
-
-        if (!swipe.swipe && isLast) {
-            return true
-        }
-
-        const role: 'user' | 'assistant' = message.is_user ? 'user' : 'assistant'
-
-        const content = replaceMacrosInternal(`${timestamp}${name}${swipe.swipe}`, instruct)
+        const shardLen = contentLength + instructLen
+        if (totalLength + shardLen > maxLength && !bypassContextLength) return false
 
         let attachments: ContentTypes[] | undefined
 
@@ -200,7 +222,10 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
                             type: 'input_audio',
                             input_audio: {
                                 data: base64,
-                                format: item.mime_type.split('/')[1],
+                                format:
+                                    item.mime_type === 'audio/mpeg'
+                                        ? 'mp3'
+                                        : item.mime_type.split('/')[1],
                             },
                         }
                     })
@@ -211,6 +236,12 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
         contextMessages.push({ role, content, attachments })
 
         totalLength += shardLen
+        const summary = params.summaryTokens?.[message.id]
+        if (summary) {
+            summaryTokens += shardLen
+            summarizedMessages += summary.summarizedMessages
+            rawSummaryTokens += summary.rawHistory
+        } else historyTokens += shardLen
 
         return true
     }
@@ -229,14 +260,15 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
     }
 
     if (messageLoader && completionState === 'initial_completed') {
-        let page = messageLoader.initialPage
+        let isLatestMessage = messages.length === 0
         while (true) {
-            let batch: ChatEntry[] | null = null
-
-            batch = await messageLoader.retrieve(page)
+            const batch = await messageLoader.loadOlder(
+                bypassContextLength ? Infinity : Math.max(0, maxLength - totalLength)
+            )
 
             for (let i = batch.length - 1; i >= 0; i--) {
-                const success = await processMessage(batch[i], -1, false)
+                const success = await processMessage(batch[i], -1, isLatestMessage)
+                isLatestMessage = false
                 if (!success) {
                     completionState = 'loader_truncated'
                     break
@@ -245,12 +277,10 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
 
             if (completionState === 'loader_truncated') break
 
-            if (batch.length < messageLoader.pageSize || batch.length === 0) {
+            if (batch.length === 0) {
                 completionState = 'loader_completed'
                 break
             }
-
-            page++
         }
     }
 
@@ -272,15 +302,25 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
 
             const results = await source.retrieve(
                 params,
-                contextMessages,
+                [...contextMessages].reverse(),
                 maxLength,
                 totalLength,
                 budget,
                 lastMessageReached
             )
+            // Release the reservation before charging the actual returned content.
+            totalLength -= source.tokenBudget
             for (const result of results) {
+                const separatorLength =
+                    result.position.type === 'relative' &&
+                    result.position.location === 'afterSystem'
+                        ? await tokenizer('\n')
+                        : 0
+                const length = result.tokenLength + separatorLength
+                if (totalLength + length > maxLength && !bypassContextLength) continue
                 pendingInsertions.push(result)
-                totalLength += result.tokenLength
+                totalLength += length
+                dataSourceTokens += length
 
                 Logger.info(
                     `[DataSource:${source.name}] inserted ${result.tokenLength} tokens from ${result.source}`
@@ -291,6 +331,8 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
 
     await runDataSources(sortedDataSources)
 
+    contextMessages.reverse()
+
     const insertMessage = (index: number, message: ContextMessage) => {
         contextMessages.splice(index, 0, message)
     }
@@ -298,7 +340,7 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
     for (const insertion of pendingInsertions) {
         const syntheticMessage: ContextMessage = {
             role: 'user',
-            content: insertion.content,
+            content: filterContextText(insertion.content, instruct, params.textFilter),
         }
 
         if (insertion.position.type === 'relative') {
@@ -325,20 +367,28 @@ export const collectContext = async (params: ContextBuilderParams & { mode: 'cha
 
         const index = insertion.position.location
 
-        if (index >= contextMessages.length) {
-            contextMessages.unshift(syntheticMessage)
-        } else {
-            insertMessage(index, syntheticMessage)
-        }
+        // Indexed insertions are depths measured back from the newest message.
+        insertMessage(Math.max(0, contextMessages.length - index), syntheticMessage)
     }
 
     Logger.info(`Approximate Context Size: ${totalLength}`)
     Logger.info(`${(performance.now() - delta).toFixed(2)}ms`)
 
+    params.onContextStats?.({
+        total: totalLength,
+        capacity: maxLength,
+        response: 0,
+        system: systemPromptLength,
+        history: historyTokens,
+        summaries: summaryTokens,
+        dataSources: dataSourceTokens,
+        summarizedMessages: summarizedMessages,
+        rawHistory: historyTokens + rawSummaryTokens,
+    })
     if (contextMessages.length === 0) warnNoMessages()
     return {
         systemPrompt: systemPrompt,
-        messages: contextMessages.reverse(),
+        messages: contextMessages,
     }
 }
 
@@ -355,22 +405,33 @@ export const buildChatCompletionContext = async (params: ContextBuilderParams) =
     const payload: Message[] = [
         {
             role: feats.systemRole,
-            [feats.contentName]: replaceMacrosInternal(systemPrompt, params.instruct),
+            [feats.contentName]: filterContextText(
+                systemPrompt,
+                params.instruct,
+                params.textFilter
+            ),
         },
     ]
 
     for (const msg of messages) {
         if (msg.attachments?.length) {
             payload.push({
-                role: msg.role,
+                role: msg.role === 'user' ? feats.userRole : feats.assistantRole,
                 [feats.contentName]: [{ type: 'text', text: msg.content }, ...msg.attachments],
             })
         } else {
             payload.push({
-                role: msg.role,
+                role: msg.role === 'user' ? feats.userRole : feats.assistantRole,
                 [feats.contentName]: msg.content,
             })
         }
+    }
+    if (feats.endWithUserTurn && messages.at(-1)?.role === 'assistant') {
+        payload.push({
+            role: feats.userRole,
+            [feats.contentName]:
+                mmkv.getString(CONTINUATION_PROMPT_KEY)?.trim() || DEFAULT_CONTINUATION_PROMPT,
+        })
     }
     printContext(
         JSON.stringify(
@@ -427,28 +488,29 @@ export const buildTextCompletionContext = async (params: ContextBuilderParams) =
     }
 
     if (!endedAtAssistant) output += instruct.last_output_prefix
-    const result = replaceMacrosInternal(output, instruct)
+    const result = filterContextText(output, instruct, params.textFilter)
     printContext(result)
     return result
 }
 
-const thinkRule = buildThinkRules()
-
-const getMacroRules = (instruct: InstructType) => {
-    const data: Macro[] = []
-    if (instruct.hide_think_tags) {
-        data.push(...thinkRule)
+const filterContextText = (
+    text: string,
+    instruct: InstructType,
+    settings: Pick<
+        ReturnType<typeof useTextFilterStore.getState>,
+        'sendFilteredText' | 'filter'
+    > = useTextFilterStore.getState()
+) => {
+    let result = text
+    const { sendFilteredText, filter } = settings
+    if (!sendFilteredText) {
+        for (const pattern of filter) result = result.replace(new RegExp(pattern, 'gi'), '')
     }
-    // for expansion
-    return data
-}
-
-const replaceMacrosInternal = (data: string, instruct: InstructType) => {
-    return replaceMacros(data, { extraMacros: getMacroRules(instruct) })
+    return result
 }
 
 const getValidAttachments = (
-    entry: ChatEntry,
+    entry: ChatMessage,
     config: {
         type: 'chatCompletions'
         userRole: string
@@ -487,20 +549,22 @@ export const getSystemPrompt = ({
     instruct,
     user,
     character,
-    userCache,
-    characterCache,
+    userCounts,
+    characterCounts,
     instructCache,
     usePrefix = true,
     useSuffix = true,
+    macroValues = getActiveMacros(),
 }: {
     instruct: InstructType
-    user?: CharacterCardData
-    character?: CharacterCardData
-    userCache: CharacterTokenCache
-    characterCache: CharacterTokenCache
+    user?: CharacterCard
+    character?: CharacterCard
+    userCounts: CharacterTokenCounts
+    characterCounts: CharacterTokenCounts
     instructCache: InstructTokenCache
     usePrefix?: boolean
     useSuffix?: boolean
+    macroValues?: MacroValues
 }) => {
     let systemPrompt = instruct.system_prompt_format
     if (systemPrompt === undefined) {
@@ -516,44 +580,51 @@ export const getSystemPrompt = ({
         {
             macro: '{{system_prefix}}',
             value: (usePrefix && instruct.system_prefix) || '',
-            length: instructCache.system_prefix_length,
+            length: usePrefix ? instructCache.system_prefix_length : 0,
         },
         {
             macro: '{{system_suffix}}',
             value: (useSuffix && instruct.system_suffix) || '',
-            length: instructCache.system_suffix_length,
+            length: useSuffix ? instructCache.system_suffix_length : 0,
         },
         {
             macro: '{{system_prompt}}',
             value: instruct.system_prompt ?? '',
-            length: instructCache.system_suffix_length,
+            length: instructCache.system_prompt_length,
         },
         {
             macro: '{{character_desc}}',
-            value: character?.description ?? '',
-            length: characterCache.description_length,
+            value: replaceMacros(character?.description ?? '', macroValues),
+            length: characterCounts.descriptionTokens,
         },
         {
             macro: '{{user_desc}}',
-            value: user?.description ?? '',
-            length: userCache.description_length,
+            value: replaceMacros(user?.description ?? '', macroValues),
+            length: userCounts.descriptionTokens,
         },
         {
             macro: '{{personality}}',
-            value: instruct.personality ? (character?.personality ?? '') : '',
-            length: instruct.personality ? characterCache.personality_length : 0,
+            value: instruct.personality
+                ? replaceMacros(character?.personality ?? '', macroValues)
+                : '',
+            length: instruct.personality ? characterCounts.personalityTokens : 0,
         },
         {
             macro: '{{scenario}}',
-            value: instruct.scenario ? (character?.scenario ?? '') : '',
-            length: instruct.scenario ? characterCache.scenario_length : 0,
+            value: instruct.scenario ? replaceMacros(character?.scenario ?? '', macroValues) : '',
+            length: instruct.scenario ? characterCounts.scenarioTokens : 0,
         },
     ]
+    const slots: Record<string, string> = {}
+    const components: { key: string; tokens: number }[] = []
     macros.forEach((m) => {
-        systemPrompt = systemPrompt.replaceAll(m.macro, m.value)
-        systemPromptLength += m.length
+        slots[m.macro.slice(2, -2)] = m.value
+        const occurrences = systemPrompt.split(m.macro).length - 1
+        systemPromptLength += m.length * occurrences
+        components.push({ key: m.macro.slice(2, -2), tokens: m.length * occurrences })
     })
-    return { systemPrompt, systemPromptLength }
+    systemPrompt = applyMacros(systemPrompt, { ...macroValues, ...slots })
+    return { systemPrompt, systemPromptLength, components }
 }
 
 const warnNoMessages = () => {

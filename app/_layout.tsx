@@ -6,6 +6,8 @@ import { ReducedMotionConfig, ReduceMotion } from 'react-native-reanimated'
 
 import { AlertProvider } from '@components/views/Alert'
 import { PortalHost } from '@components/views/Portal'
+import PlaybackPlayer from '@components/views/PlaybackPlayer'
+import ScreenNoticeLayout from '@components/views/ScreenNoticeLayout'
 import { useAppStateNotificationObserver } from '@lib/notifications/Notifications'
 import { Theme } from '@lib/theme/ThemeManager'
 import '../i18n/i18n'
@@ -21,10 +23,19 @@ const Layout = () => {
     useAppStateNotificationObserver()
     return (
         <GestureHandlerRootView style={{ flex: 1 }}>
+            {/**
+             * `Transition Animation Scale` dev settings causes react-native-reanimated transitions to break
+             * when set to `off`. <ReducedMotionConfig /> allows us to ignore this setting.
+             *
+             * Refer to https://github.com/Vali-98/ChatterUI/issues/650
+             */}
             <ReducedMotionConfig mode={ReduceMotion.Never} />
             <KeyboardProvider>
                 <AlertProvider />
                 <Stack
+                    screenLayout={({ children, route }) => (
+                        <ScreenNoticeLayout routeName={route.name}>{children}</ScreenNoticeLayout>
+                    )}
                     screenOptions={{
                         headerBackButtonDisplayMode: 'minimal',
                         headerStyle: { backgroundColor: color.neutral._100 },
@@ -33,10 +44,11 @@ const Layout = () => {
                         contentStyle: { backgroundColor: color.neutral._100 },
                         headerShadowVisible: false,
                         headerTitleAlign: 'center',
-                        statusBarStyle: 'auto',
+                        statusBarStyle: color.mode === 'dark' ? 'light' : 'dark',
                     }}>
                     <Stack.Screen name="index" options={{ animation: 'fade' }} />
                 </Stack>
+                <PlaybackPlayer />
                 <PortalHost />
             </KeyboardProvider>
         </GestureHandlerRootView>

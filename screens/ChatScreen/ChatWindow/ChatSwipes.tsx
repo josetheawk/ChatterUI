@@ -1,0 +1,180 @@
+import { useFocusEffect } from 'expo-router'
+import React, { useCallback } from 'react'
+import { StyleSheet, Text, View } from 'react-native'
+import { measure, useAnimatedRef, useFrameCallback } from 'react-native-reanimated'
+
+import IconButton from '@components/buttons/IconButton'
+import { ChatSwipe } from '@db/schema'
+import { useCanStartGeneration } from '@lib/engine/generation/hooks'
+import { continueResponse, generateResponse, regenerateResponse } from '@lib/engine/Inference'
+import { useLiveQueryAsync } from '@lib/hooks/liveQuery'
+import { Chats } from '@lib/state/chat'
+import { chatSwipeControlBounds } from '@lib/state/components/chatControlBounds'
+import { useChatControlLayoutState } from '@lib/state/components/ChatControls'
+import { Theme } from '@lib/theme/ThemeManager'
+
+type SwipesProps = {
+    isGenerating: boolean
+    isGreeting: boolean
+    swipe: ChatSwipe
+}
+
+const ChatSwipes: React.FC<SwipesProps> = ({ isGenerating, isGreeting, swipe }) => {
+    const styles = useStyles()
+    const { chatId } = Chats.useChat()
+    const canGenerate = useCanStartGeneration(chatId)
+    const { data: swipeIdListData } = useLiveQueryAsync(Chats.db.live.swipeIds(swipe.entry_id), {
+        key: ['swipe-ids', swipe.entry_id],
+        watch: [{ table: 'chat_swipes' }],
+    })
+    const swipeIdList = swipeIdListData.map((item) => item.id)
+
+    const currentIndex = swipeIdList.indexOf(swipe.id)
+    const ref = useAnimatedRef<View>()
+    const entryId = swipe.entry_id
+    const playerHeight = useChatControlLayoutState((state) => state.playerHeight)
+    const visible = currentIndex !== -1 && !(isGreeting && swipeIdList.length === 1)
+    const frame = useFrameCallback(() => {
+        const bounds = measure(ref)
+        if (!bounds || bounds.height <= 0 || bounds.width <= 0) {
+            chatSwipeControlBounds.set((previous) =>
+                previous?.entryId === entryId ? null : previous
+            )
+            return
+        }
+        const next = {
+            top: Math.round(bounds.pageY),
+            bottom: Math.round(bounds.pageY + bounds.height),
+            left: Math.round(bounds.pageX),
+            right: Math.round(bounds.pageX + bounds.width),
+            entryId: entryId,
+        }
+        const previous = chatSwipeControlBounds.value
+        if (
+            !previous ||
+            previous.entryId !== next.entryId ||
+            previous.top !== next.top ||
+            previous.bottom !== next.bottom ||
+            previous.left !== next.left ||
+            previous.right !== next.right
+        )
+            chatSwipeControlBounds.set(next)
+    }, false)
+    useFocusEffect(
+        useCallback(() => {
+            frame.setActive(visible && playerHeight > 0)
+            return () => {
+                frame.setActive(false)
+                chatSwipeControlBounds.set((previous) =>
+                    previous?.entryId === entryId ? null : previous
+                )
+            }
+        }, [frame, visible, playerHeight, entryId])
+    )
+
+    // return if no list, bad index, or if no alt greetings
+    if (!swipeIdList || currentIndex === -1 || (isGreeting && swipeIdList.length === 1)) return
+
+    const handleSwipeLeft = () => {
+        if (!canGenerate) return
+        if (currentIndex <= 0) return
+        const newSwipeId = swipeIdList[currentIndex - 1]
+        if (newSwipeId) Chats.db.update.activeSwipe(newSwipeId)
+    }
+
+    const handleSwipeRight = (message: string) => {
+        if (!canGenerate) return
+        if (currentIndex >= swipeIdList.length - 1) {
+            const newSwipe = Chats.actions.createSwipe(
+                swipe.entry_id,
+                message,
+                message ? { sourceSwipeId: swipe.id } : {}
+            )
+            if (!newSwipe) return
+            if (message) continueResponse(newSwipe)
+            else generateResponse(newSwipe.id)
+        } else {
+            const newSwipeId = swipeIdList[currentIndex + 1]
+            if (newSwipeId) Chats.db.update.activeSwipe(newSwipeId)
+        }
+    }
+
+    const isLastAltGreeting = isGreeting && currentIndex === swipeIdList.length - 1
+    const isFirstSwipe = currentIndex === 0
+
+    const disableSwipeLeft = isGenerating || isFirstSwipe
+    const disableSwipeRight = isGenerating || isLastAltGreeting
+
+    return (
+        <View ref={ref} collapsable={false} style={styles.swipesItem}>
+            <IconButton
+                viewStyle={styles.swipeButton}
+                onPress={handleSwipeLeft}
+                disabled={disableSwipeLeft}
+                iconName="left"
+                iconSize={20}
+            />
+
+            {!isGreeting && (
+                <IconButton
+                    onPress={() => regenerateResponse(swipe)}
+                    onLongPress={() => regenerateResponse(swipe, false)}
+                    disabled={isGenerating}
+                    viewStyle={styles.swipeButton}
+                    iconName="retweet"
+                    iconSize={20}
+                />
+            )}
+
+            <Text style={styles.swipeText}>
+                {currentIndex + 1} / {swipeIdList.length}
+            </Text>
+
+            {!isGreeting && (
+                <IconButton
+                    onPress={() => continueResponse(swipe)}
+                    disabled={isGenerating}
+                    viewStyle={styles.swipeButton}
+                    iconName="forward"
+                    iconSize={20}
+                />
+            )}
+
+            <IconButton
+                viewStyle={styles.swipeButton}
+                onPress={() => handleSwipeRight('')}
+                onLongPress={() => handleSwipeRight(swipe.swipe ?? '')}
+                disabled={disableSwipeRight}
+                iconName="right"
+                iconSize={20}
+            />
+        </View>
+    )
+}
+
+export default ChatSwipes
+
+const useStyles = () => {
+    const { color, spacing } = Theme.useTheme()
+    return StyleSheet.create({
+        swipesItem: {
+            flexDirection: 'row',
+            justifyContent: 'space-evenly',
+            flex: 1,
+            marginTop: spacing.sm,
+            zIndex: 32,
+        },
+
+        swipeText: {
+            color: color.text._200,
+            paddingVertical: spacing.sm,
+            paddingHorizontal: spacing.m,
+        },
+
+        swipeButton: {
+            alignItems: 'center',
+            flex: 1,
+            paddingVertical: spacing.sm,
+        },
+    })
+}

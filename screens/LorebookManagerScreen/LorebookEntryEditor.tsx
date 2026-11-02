@@ -1,0 +1,290 @@
+import { useCallback, useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { View } from 'react-native'
+import { KeyboardAwareScrollView } from 'react-native-keyboard-controller'
+import { create } from 'zustand'
+import { useShallow } from 'zustand/react/shallow'
+
+import ListEditorSheet from '@components/input/ListEditorSheet'
+import ThemedSlider from '@components/input/ThemedSlider'
+import ThemedSwitchRow from '@components/input/ThemedSwitchRow'
+import ThemedTextInput from '@components/input/ThemedTextInput'
+import Alert from '@components/views/Alert'
+import BottomSheet, { BottomSheetRef, createBottomSheetRef } from '@components/views/BottomSheet'
+import BottomSheetControls, { BottomSheetButton } from '@components/views/BottomSheetControls'
+import { LorebookEntryType } from '@db/schema'
+import { useLiveQueryAsync } from '@lib/hooks/liveQuery'
+import { Lorebooks } from '@lib/state/lorebooks'
+import { Theme } from '@lib/theme/ThemeManager'
+
+type LorebookEntryEditorStateProps = {
+    ref: BottomSheetRef | null
+    entryId?: number
+
+    open: (entryId: number) => void
+    close: () => void
+    clear: () => void
+}
+
+export const useLorebookEntryEditorState = create<LorebookEntryEditorStateProps>()((set, get) => ({
+    ref: createBottomSheetRef(),
+
+    entryId: undefined,
+
+    open: (entryId) => {
+        set({ entryId })
+        get().ref?.current?.open()
+    },
+
+    close: () => {
+        get().ref?.current?.close()
+    },
+    clear: () => set({ entryId: undefined }),
+}))
+
+const LorebookEntryEditor = () => {
+    const { t } = useTranslation()
+    const { spacing } = Theme.useTheme()
+
+    const { close, clear, entryId, ref } = useLorebookEntryEditorState(useShallow((state) => state))
+
+    const [placeholderEntry, setPlaceholderEntry] = useState<LorebookEntryType | undefined>(
+        undefined
+    )
+    const [edited, setEdited] = useState(false)
+
+    const handleSetPlaceholder = useCallback((entry: LorebookEntryType, isEdited = true) => {
+        setPlaceholderEntry(entry)
+        setEdited(isEdited)
+    }, [])
+
+    const { data: entry } = useLiveQueryAsync(Lorebooks.db.live.lorebookEntry(entryId ?? -1), {
+        keepPreviousData: false,
+        key: ['lorebook-entry-editor', entryId],
+        watch: [{ table: 'lorebook_entries', rowId: entryId ?? -1 }],
+        enabled: entryId !== undefined,
+    })
+    useEffect(() => {
+        // Refresh the local draft when its saved database record changes.
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        if (entry) setPlaceholderEntry(entry)
+    }, [entry])
+
+    const backAction = useCallback(
+        (closeSheet: () => void) => {
+            if (!entry || !placeholderEntry || !edited) {
+                return closeSheet()
+            }
+
+            Alert.alert({
+                title: t('common.alert.unsaved.title'),
+                description: t('common.alert.unsaved.description'),
+                buttons: [
+                    {
+                        label: t('common.actions.cancel'),
+                    },
+                    {
+                        label: t('common.actions.discardChanges'),
+                        onPress: closeSheet,
+                        type: 'warning',
+                    },
+                    {
+                        label: t('common.actions.save'),
+                        onPress: async () => {
+                            await Lorebooks.db.mutate.updateLorebookEntry(entry.id, {
+                                name: placeholderEntry.name,
+                                content: placeholderEntry.content,
+                                keys: placeholderEntry.keys,
+                                secondary_keys: placeholderEntry.secondary_keys,
+                                enable: placeholderEntry.enable,
+                                insertion_order: placeholderEntry.insertion_order,
+                                case_sensitive: placeholderEntry.case_sensitive,
+                                priority: placeholderEntry.priority,
+                                selective: placeholderEntry.selective,
+                                constant: placeholderEntry.constant,
+                                comment: placeholderEntry.comment,
+                            })
+
+                            closeSheet()
+                        },
+                    },
+                ],
+            })
+
+            return true
+        },
+        [entry, placeholderEntry, edited, t]
+    )
+
+    const updateEntry = <K extends keyof LorebookEntryType>(
+        key: K,
+        value: LorebookEntryType[K]
+    ) => {
+        if (!placeholderEntry) return
+        handleSetPlaceholder({
+            ...placeholderEntry,
+            [key]: value,
+        })
+    }
+
+    const save = async () => {
+        if (!entry || !placeholderEntry) return
+        await Lorebooks.db.mutate.updateLorebookEntry(entry.id, placeholderEntry)
+        close()
+    }
+
+    return (
+        <BottomSheet
+            onRequestClose={backAction}
+            onClose={clear}
+            sheetStyle={{ flex: 1 }}
+            ref={ref}
+            bodyContainerStyle={[{ paddingHorizontal: 16, paddingVertical: 16 }, { flex: 1 }]}>
+            {entry && placeholderEntry && entryId && (
+                <>
+                    <KeyboardAwareScrollView
+                        keyboardShouldPersistTaps="handled"
+                        showsVerticalScrollIndicator={false}
+                        contentContainerStyle={{
+                            rowGap: spacing.xl,
+                            paddingBottom: spacing.xl2,
+                        }}>
+                        <ThemedTextInput
+                            label={t('common.labels.name')}
+                            value={placeholderEntry.name}
+                            onChangeText={(value) => updateEntry('name', value)}
+                        />
+
+                        <ListEditorSheet
+                            title={t('lorebook.fields.keys')}
+                            placeholder={t('lorebook.fields.keysPlaceholder')}
+                            keyExtractor={(item) => item}
+                            labelExtractor={(item) => item}
+                            createItem={(text) => text}
+                            commitMode="confirm"
+                            value={placeholderEntry.keys}
+                            onChangeValue={(value) => updateEntry('keys', value)}
+                        />
+
+                        <ThemedTextInput
+                            label={t('common.labels.content')}
+                            multiline
+                            numberOfLines={10}
+                            value={placeholderEntry.content}
+                            onChangeText={(value) => updateEntry('content', value)}
+                        />
+
+                        <ThemedTextInput
+                            label={t('common.labels.comment')}
+                            multiline
+                            numberOfLines={3}
+                            value={placeholderEntry.comment}
+                            onChangeText={(value) => updateEntry('comment', value)}
+                        />
+
+                        <ThemedSwitchRow
+                            label={t('common.actions.enable')}
+                            value={placeholderEntry.enable}
+                            onChangeValue={(value) => updateEntry('enable', value)}
+                        />
+
+                        <ThemedSwitchRow
+                            label={t('lorebook.fields.caseSensitive')}
+                            value={placeholderEntry.case_sensitive}
+                            onChangeValue={(value) => updateEntry('case_sensitive', value)}
+                        />
+
+                        <ThemedSwitchRow
+                            label={t('lorebook.fields.selective')}
+                            value={placeholderEntry.selective}
+                            onChangeValue={(value) => updateEntry('selective', value)}
+                        />
+
+                        {placeholderEntry.selective && (
+                            <ListEditorSheet
+                                title={t('lorebook.fields.secondaryKeys')}
+                                placeholder={t('lorebook.fields.keysPlaceholder')}
+                                keyExtractor={(item) => item}
+                                labelExtractor={(item) => item}
+                                createItem={(text) => text}
+                                commitMode="confirm"
+                                value={placeholderEntry.secondary_keys}
+                                onChangeValue={(value) => updateEntry('secondary_keys', value)}
+                            />
+                        )}
+
+                        <ThemedSwitchRow
+                            label={t('lorebook.fields.constant')}
+                            value={placeholderEntry.constant}
+                            onChangeValue={(value) => updateEntry('constant', value)}
+                        />
+
+                        <ThemedSlider
+                            label={t('lorebook.fields.insertionOrder')}
+                            min={0}
+                            max={1000}
+                            step={1}
+                            value={placeholderEntry.insertion_order}
+                            onValueChange={(value) => updateEntry('insertion_order', value)}
+                        />
+
+                        <ThemedSlider
+                            label={t('lorebook.fields.priority')}
+                            min={0}
+                            max={1000}
+                            step={1}
+                            value={placeholderEntry.priority}
+                            onValueChange={(value) => updateEntry('priority', value)}
+                        />
+                    </KeyboardAwareScrollView>
+
+                    <BottomSheetControls>
+                        <BottomSheetButton
+                            label={t('common.actions.delete')}
+                            variant="secondary"
+                            iconName="delete"
+                            onPress={() => {
+                                Alert.alert({
+                                    title: t('lorebook.deleteEntry.title'),
+                                    description: t('lorebook.deleteEntry.description', {
+                                        name: entry.name,
+                                    }),
+                                    buttons: [
+                                        {
+                                            label: t('common.actions.cancel'),
+                                        },
+                                        {
+                                            label: t('common.actions.delete'),
+                                            onPress: async () => {
+                                                await Lorebooks.db.mutate.deleteLorebookEntry(
+                                                    entry.id
+                                                )
+                                                close()
+                                            },
+                                            type: 'warning',
+                                        },
+                                    ],
+                                })
+                            }}
+                            level="error"
+                        />
+                        <BottomSheetButton
+                            label={t('common.actions.reset')}
+                            variant="tertiary"
+                            iconName="reload"
+                            onPress={() => handleSetPlaceholder(entry, false)}
+                        />
+                        <BottomSheetButton
+                            label={t('common.actions.save')}
+                            variant="secondary"
+                            iconName="save"
+                            onPress={save}
+                        />
+                    </BottomSheetControls>
+                </>
+            )}
+        </BottomSheet>
+    )
+}
+
+export default LorebookEntryEditor

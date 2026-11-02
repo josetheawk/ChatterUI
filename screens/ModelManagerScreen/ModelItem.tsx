@@ -1,0 +1,313 @@
+import { useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { StyleSheet, Text, TouchableOpacity, View } from 'react-native'
+import { useShallow } from 'zustand/react/shallow'
+
+import IconButton from '@components/buttons/IconButton'
+import DropdownSheet from '@components/input/DropdownSheet'
+import Alert from '@components/views/Alert'
+import { useBottomSheetRef } from '@components/views/BottomSheet'
+import ContextMenu from '@components/views/ContextMenu'
+import InputSheet from '@components/views/InputSheet'
+import ListCard, { ListCardSection } from '@components/views/ListCard'
+import { ModelDataType } from '@db/schema'
+import { GGMLNameMap } from '@lib/engine/Local'
+import { Llama } from '@lib/engine/Local/LlamaLocal'
+import { Model, ModelListQueryType } from '@lib/engine/Local/Model'
+import { Logger } from '@lib/state/Logger'
+import { Theme } from '@lib/theme/ThemeManager'
+import { readableFileSize } from '@lib/utils/File'
+
+type ModelItemProps = {
+    item: ModelListQueryType
+    modelLoading: boolean
+    mmprojList: ModelDataType[]
+    modelImporting: boolean
+}
+
+const ModelItem: React.FC<ModelItemProps> = ({
+    item,
+    modelImporting,
+    modelLoading,
+    mmprojList,
+}) => {
+    const { t } = useTranslation()
+    const styles = useStyles()
+    const { color } = Theme.useTheme()
+    const [showMMPROJSelector, setShowMMPROJSelector] = useState(false)
+    const [showInfo, setShowInfo] = useState(false)
+    const { loadModel, unloadModel, modelId, mmprojId } = Llama.useLlamaModelStore(
+        useShallow((state) => ({
+            loadModel: state.load,
+            unloadModel: state.unload,
+            modelId: state.model?.id,
+            mmprojId: state.mmproj?.id,
+        }))
+    )
+
+    const maybeClearLastLoaded = Llama.useLlamaPreferencesStore(
+        useShallow((state) => state.maybeClearLastLoaded)
+    )
+
+    const editInputRef = useBottomSheetRef()
+    //@ts-ignore
+    const quant: string = item.quantization && GGMLNameMap[item.quantization]
+    const isInvalid = Model.isInitialEntry(item)
+    const handleDeleteModel = () => {
+        Alert.alert({
+            title: t('model.alert.deletemodel.title'),
+            description:
+                t('model.alert.deletemodel.description', { name: item.name }) +
+                (!isInvalid
+                    ? !item.file_path.startsWith('content')
+                        ? t('model.alert.deletemodel.internal', {
+                              size: readableFileSize(item.file_size),
+                          })
+                        : t('model.alert.deletemodel.external')
+                    : ''),
+            buttons: [
+                { label: t('common.actions.cancel') },
+                {
+                    label: t('model.alert.deletemodel.title'),
+                    onPress: async () => {
+                        if (modelId === item.id) {
+                            await unloadModel()
+                        }
+                        await Model.deleteModelById(item.id)
+                        maybeClearLastLoaded(item)
+                    },
+                    type: 'warning',
+                },
+            ],
+        })
+    }
+
+    const handleUnlinkMMPROJ = async () => {
+        if (item.mmprojLink) return await Model.removeMMPROJLink(item)
+        setShowMMPROJSelector(!showMMPROJSelector)
+    }
+
+    const handleLoadModel = async () => {
+        try {
+            if (isLoaded) await unloadModel()
+            else await loadModel(item)
+        } catch (error) {
+            Logger.error(error)
+        }
+    }
+
+    const isMMPROJ = Model.isMMPROJ(item.architecture)
+    const isLoaded = isMMPROJ ? mmprojId === item.id : modelId === item.id
+
+    const disable =
+        modelLoading ||
+        isInvalid ||
+        modelImporting ||
+        (isMMPROJ ? !modelId || isLoaded : modelId !== undefined)
+    const disableEdit = isLoaded || modelLoading || isInvalid
+    const disableDelete = isLoaded || modelLoading
+
+    const loadToggle = isLoaded ? modelLoading || modelImporting : disable
+
+    const tags = [
+        item.params === 'N/A' ? t('model.item.noparamsize') : item.params,
+        quant,
+        item.architecture,
+    ]
+    const location = item.file_path.startsWith('content')
+        ? t('common.labels.external')
+        : t('common.labels.internal')
+
+    const mmprojName =
+        mmprojList.filter((e) => e.id === item.mmprojLink?.mmproj_id)?.[0]?.name ?? undefined
+
+    return (
+        <ListCard style={{ paddingHorizontal: 24 }} active={isLoaded}>
+            <InputSheet
+                ref={editInputRef}
+                onConfirm={async (name) => {
+                    await Model.updateName(name, item.id)
+                }}
+                title={t('model.item.rename')}
+                defaultValue={item.name}
+            />
+
+            <ListCardSection style={{ flex: 1 }}>
+                <TouchableOpacity
+                    onPress={() => setShowInfo(!showInfo)}
+                    style={{ paddingVertical: 18 }}>
+                    <Text style={styles.title}>{item.name}</Text>
+
+                    {showInfo && !isInvalid && (
+                        <>
+                            <View style={styles.tagContainer}>
+                                {tags.map((tag, i) => {
+                                    return (
+                                        <Text key={i} style={styles.tag} numberOfLines={1}>
+                                            {tag}
+                                        </Text>
+                                    )
+                                })}
+                            </View>
+
+                            {isInvalid && (
+                                <View style={styles.tagContainer}>
+                                    <Text style={styles.tag}>{t('model.item.invalid')}</Text>
+                                </View>
+                            )}
+
+                            {!isMMPROJ && (
+                                <Text style={styles.subtitle}>
+                                    {t('model.item.contextlength')}: {item.context_length}
+                                </Text>
+                            )}
+
+                            <Text style={styles.subtitle}>
+                                {t('model.item.file')}: {item.file.replace('.gguf', '')} (
+                                {readableFileSize(item.file_size)}, {location})
+                            </Text>
+                        </>
+                    )}
+
+                    {mmprojName && (
+                        <Text style={styles.subtitle}>
+                            {t('model.mmproj')}: {mmprojName}
+                        </Text>
+                    )}
+                </TouchableOpacity>
+            </ListCardSection>
+
+            <ListCardSection style={styles.buttonContainer}>
+                <ContextMenu disabled={disableEdit}>
+                    <ContextMenu.Trigger
+                        icon="edit"
+                        iconStyle={{ color: disableEdit ? color.text._700 : color.text._400 }}
+                        iconSize={22}
+                    />
+                    <ContextMenu.Body>
+                        {!(isMMPROJ || !!item.mmprojLink || mmprojList.length === 0) && (
+                            <DropdownSheet
+                                keyExtractor={(item) => item.id}
+                                modalTitle={t('model.selectmmproj')}
+                                style={{
+                                    backgroundColor: color.neutral._200,
+                                    paddingVertical: 10,
+                                }}
+                                containerStyle={{ marginTop: 8 }}
+                                placeholder={t('model.linkmmproj')}
+                                data={mmprojList}
+                                selected={
+                                    mmprojList.filter(
+                                        (e) => e.id === item.mmprojLink?.mmproj_id
+                                    )?.[0] ?? undefined
+                                }
+                                labelExtractor={(item) => item.name}
+                                onChangeValue={async (value) => {
+                                    try {
+                                        if (item.mmprojLink) await Model.removeMMPROJLink(item)
+                                        await Model.createMMPROJLink(item, value)
+                                    } catch (e) {
+                                        Logger.errorToast(t('model.toast.failedtolink'), e)
+                                    }
+                                }}
+                                icon={'link'}
+                                iconPosition="left"
+                                iconSize={16}
+                            />
+                        )}
+                        <ContextMenu.Button
+                            hidden={isMMPROJ || !item.mmprojLink}
+                            label={t('model.unlinkmmproj')}
+                            onPress={() => {
+                                handleUnlinkMMPROJ()
+                            }}
+                            icon="disconnect"
+                        />
+                        <ContextMenu.Button
+                            hidden={disableEdit}
+                            label={t('common.actions.rename')}
+                            onPress={() => {
+                                editInputRef.current?.open()
+                            }}
+                            icon="edit"
+                        />
+                        <ContextMenu.Button
+                            hidden={disableDelete}
+                            label={t('common.actions.delete')}
+                            onPress={() => {
+                                handleDeleteModel()
+                            }}
+                            variant="warning"
+                            icon="delete"
+                        />
+                    </ContextMenu.Body>
+                </ContextMenu>
+
+                {!isMMPROJ && (
+                    <IconButton
+                        disabled={loadToggle}
+                        onPress={handleLoadModel}
+                        iconName={isLoaded ? 'close-circle' : 'play-circle'}
+                        iconSize={24}
+                        level={isLoaded ? 'error' : 'primary'}
+                    />
+                )}
+            </ListCardSection>
+        </ListCard>
+    )
+}
+
+export default ModelItem
+
+const useStyles = () => {
+    const { color, spacing, borderRadius, fontSize } = Theme.useTheme()
+
+    return StyleSheet.create({
+        modelContainer: {
+            borderRadius: spacing.l,
+            paddingVertical: spacing.l,
+            paddingHorizontal: spacing.xl2,
+            backgroundColor: color.neutral._200,
+            minHeight: 64,
+            columnGap: 12,
+            alignItems: 'center',
+            marginBottom: spacing.l,
+            flexDirection: 'row',
+            justifyContent: 'space-between',
+        },
+
+        tagContainer: {
+            columnGap: 2,
+            rowGap: 2,
+            paddingTop: spacing.m,
+            paddingBottom: spacing.m,
+            flexDirection: 'row',
+            justifyContent: 'flex-start',
+            flexWrap: 'wrap',
+        },
+
+        tag: {
+            borderRadius: borderRadius.m,
+            borderColor: color.primary._300,
+            borderWidth: 1,
+            paddingHorizontal: spacing.m,
+            paddingVertical: spacing.s,
+            color: color.text._300,
+            textTransform: 'capitalize',
+        },
+        title: {
+            fontSize: fontSize.l,
+            color: color.text._100,
+        },
+
+        subtitle: {
+            color: color.text._400,
+        },
+
+        buttonContainer: {
+            flexDirection: 'row',
+            alignItems: 'center',
+            columnGap: spacing.xl2,
+        },
+    })
+}

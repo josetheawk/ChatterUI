@@ -6,15 +6,13 @@ import React, { ReactNode, useCallback, useMemo, useState } from 'react'
 import { Platform, StyleSheet, Text, useWindowDimensions, View } from 'react-native'
 import { MarkdownIt } from 'react-native-markdown-display'
 
-import ThemedButton from '@components/buttons/ThemedButton'
-import Accordion from '@components/views/Accordion'
+import IconButton from '@components/buttons/IconButton'
 import { ChatStyle } from '@lib/state/ChatStyle'
 import { Logger } from '@lib/state/Logger'
 import { Theme } from '@lib/theme/ThemeManager'
 
 import latexPlugin from './MarkdownLatexPlugin'
 import doubleQuotePlugin from './MarkdownQuotePlugin'
-import thinkPlugin from './MarkdownThinkPlugin'
 
 const getDeepASTDirection = (astNode: any): 'ltr' | 'rtl' | 'neutral' => {
     if (!astNode) return 'neutral'
@@ -106,10 +104,7 @@ const ImageAdapter = ({
 }
 
 export namespace MarkdownStyle {
-    export const Rules = MarkdownIt({ typographer: true })
-        .use(thinkPlugin)
-        .use(doubleQuotePlugin)
-        .use(latexPlugin)
+    export const Rules = MarkdownIt({ typographer: true }).use(doubleQuotePlugin).use(latexPlugin)
 
     export const RenderRules: Record<string, (...props: any) => ReactNode> = {
         fence: (node: any, children: any, parent: any, styles: any, inheritedStyles = {}) => {
@@ -127,7 +122,7 @@ export namespace MarkdownStyle {
                             {sourceInfo || 'Code'}
                         </Text>
                         {content && (
-                            <ThemedButton
+                            <IconButton
                                 iconName="copy"
                                 variant="tertiary"
                                 iconStyle={{ color: styles.fenceHeader.color }}
@@ -173,20 +168,6 @@ export namespace MarkdownStyle {
                 </Text>
             )
         },
-        think: (node: any, children: any, parent: any, styles: any) => {
-            return (
-                <Accordion
-                    key={node.key}
-                    label={node.sourceInfo ? 'Thought Process' : 'Thinking...'}
-                    style={{
-                        flex: 1,
-                        marginBottom: 8,
-                        elevation: 8,
-                    }}>
-                    {children}
-                </Accordion>
-            )
-        },
         latex_block: (node: any, children: any, parent: any, styles: any) => {
             const { content } = node
             return (
@@ -194,7 +175,7 @@ export namespace MarkdownStyle {
                     latex={content ?? ''}
                     key={node.key}
                     style={styles.latex_block}
-                    color={styles.latex_block.color ?? 'white'}
+                    color={styles.latex_block.color}
                 />
             )
         },
@@ -204,8 +185,8 @@ export namespace MarkdownStyle {
                 <RaTeXView
                     latex={content ?? ''}
                     key={node.key}
-                    style={styles.latex_block}
-                    color={styles.latex_block.color ?? 'white'}
+                    style={styles.latex_inline}
+                    color={styles.latex_inline.color}
                 />
             )
         },
@@ -352,9 +333,10 @@ export namespace MarkdownStyle {
         return useMemo(
             () =>
                 StyleSheet.create({
-                    double_quote: { color: color.quote },
+                    double_quote: { color: color.chat.markdown.quote },
                     // The main container
                     body: {
+                        color: color.chat.text,
                         textAlign: 'auto',
                     },
 
@@ -362,37 +344,31 @@ export namespace MarkdownStyle {
                     heading1: {
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(32),
-                        color: color.text._100,
                         fontWeight: getModifiedFontWeight(500),
                     },
                     heading2: {
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(24),
-                        color: color.text._100,
                         fontWeight: getModifiedFontWeight(500),
                     },
                     heading3: {
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(18),
-                        color: color.text._100,
                         fontWeight: getModifiedFontWeight(500),
                     },
                     heading4: {
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(16),
-                        color: color.text._100,
                         fontWeight: getModifiedFontWeight(500),
                     },
                     heading5: {
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(13),
-                        color: color.text._100,
                         fontWeight: getModifiedFontWeight(500),
                     },
                     heading6: {
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(11),
-                        color: color.text._100,
                         fontWeight: getModifiedFontWeight(500),
                     },
 
@@ -406,25 +382,24 @@ export namespace MarkdownStyle {
                     // Emphasis
                     strong: {
                         fontWeight: getModifiedFontWeight(700),
-                        color: color.text._100,
                     },
                     em: {
                         fontStyle: 'italic',
-                        color: color.text._400,
+                        color: color.chat.markdown.emphasis,
                     },
                     s: {
                         textDecorationLine: 'line-through',
-                        color: color.text._400,
+                        color: color.chat.metadata,
                     },
 
                     // Blockquotes
                     blockquote: {
-                        backgroundColor: color.neutral._200,
-                        borderColor: color.primary._500,
+                        backgroundColor: color.chat.markdown.blockquote.background,
+                        borderColor: color.chat.markdown.blockquote.border,
                         borderLeftWidth: 4,
                         marginLeft: spacing.sm,
                         paddingHorizontal: spacing.sm,
-                        color: color.text._400,
+                        color: color.chat.markdown.blockquote.text,
                     },
 
                     // Lists
@@ -437,11 +412,10 @@ export namespace MarkdownStyle {
                     list_item: {
                         flexDirection: 'row',
                         justifyContent: 'flex-start',
-                        color: color.text._100,
                     },
                     // @pseudo class, does not have a unique render rule
                     bullet_list_icon: {
-                        color: color.text._400,
+                        color: color.chat.metadata,
                         marginLeft: spacing.m,
                         marginRight: spacing.m,
                     },
@@ -451,7 +425,7 @@ export namespace MarkdownStyle {
                     },
                     // @pseudo class, does not have a unique render rule
                     ordered_list_icon: {
-                        color: color.text._400,
+                        color: color.chat.metadata,
                         marginLeft: spacing.m,
                         marginRight: spacing.m,
                     },
@@ -462,7 +436,8 @@ export namespace MarkdownStyle {
 
                     // Code
                     code_inline: {
-                        backgroundColor: color.neutral._200,
+                        color: color.chat.markdown.inlineCode.text,
+                        backgroundColor: color.chat.markdown.inlineCode.background,
                         paddingHorizontal: spacing.m,
                         flex: 1,
                         borderRadius: 4,
@@ -476,10 +451,10 @@ export namespace MarkdownStyle {
                         }),
                     },
                     code_block: {
-                        color: color.text._400,
+                        color: color.chat.markdown.codeBlock.text,
                         borderWidth: 1,
-                        borderColor: color.neutral._100,
-                        backgroundColor: color.neutral._200,
+                        borderColor: color.chat.markdown.codeBlock.headerBackground,
+                        backgroundColor: color.chat.markdown.codeBlock.background,
                         padding: 4,
                         borderRadius: 8,
                         ...Platform.select({
@@ -492,9 +467,9 @@ export namespace MarkdownStyle {
                         }),
                     },
                     fence: {
-                        color: color.text._300,
-                        backgroundColor: color.neutral._100,
-                        borderColor: color.neutral._200,
+                        color: color.chat.markdown.codeBlock.text,
+                        backgroundColor: color.chat.markdown.codeBlock.background,
+                        borderColor: color.chat.markdown.codeBlock.headerBackground,
                         borderWidth: 2,
                         paddingLeft: spacing.l,
                         paddingRight: spacing.l,
@@ -513,13 +488,13 @@ export namespace MarkdownStyle {
                     },
 
                     fenceHeader: {
-                        color: color.text._300,
+                        color: color.chat.markdown.codeBlock.headerText,
                         flexDirection: 'row',
                         justifyContent: 'space-between',
                         alignItems: 'center',
                         paddingVertical: 4,
                         paddingHorizontal: 12,
-                        backgroundColor: color.neutral._200,
+                        backgroundColor: color.chat.markdown.codeBlock.headerBackground,
                         borderTopLeftRadius: borderRadius.m,
                         borderTopRightRadius: borderRadius.m,
                         marginTop: spacing.sm,
@@ -528,16 +503,16 @@ export namespace MarkdownStyle {
                     // Tables
                     table: {
                         borderWidth: 2,
-                        borderColor: color.neutral._300,
+                        borderColor: color.chat.markdown.table.border,
                         borderRadius: borderRadius.m,
                         marginBottom: spacing.m,
                         overflow: 'hidden',
                     },
                     thead: {
-                        backgroundColor: color.neutral._300,
+                        backgroundColor: color.chat.markdown.table.headerBackground,
                     },
                     tbody: {
-                        backgroundColor: color.neutral._200,
+                        backgroundColor: color.chat.markdown.table.background,
                     },
                     th: {
                         flex: 1,
@@ -545,7 +520,7 @@ export namespace MarkdownStyle {
                     },
                     tr: {
                         borderBottomWidth: 1,
-                        borderColor: color.neutral._300,
+                        borderColor: color.chat.markdown.table.border,
                         flexDirection: 'row',
                         fontSize: getModifiedFontSize(14),
                     },
@@ -556,11 +531,12 @@ export namespace MarkdownStyle {
 
                     // Links
                     link: {
+                        color: color.chat.markdown.link,
                         textDecorationLine: 'underline',
                     },
                     blocklink: {
                         flex: 1,
-                        borderColor: '#000000',
+                        borderColor: color.chat.markdown.link,
                         borderBottomWidth: 1,
                     },
 
@@ -576,15 +552,14 @@ export namespace MarkdownStyle {
 
                     textgroup: {
                         fontWeight: getModifiedFontWeight(400),
-                        color: color.text._100,
                         width: '100%',
                     },
                     latex_inline: {
-                        color: color.text._300,
+                        color: color.chat.text,
                         fontSize: getModifiedFontSize(16),
                     },
                     latex_block: {
-                        color: color.text._300,
+                        color: color.chat.text,
                         fontSize: getModifiedFontSize(16),
                         marginTop: spacing.l,
                         marginBottom: spacing.sm,
@@ -592,7 +567,6 @@ export namespace MarkdownStyle {
                     paragraph: {
                         flexWrap: 'wrap',
                         textAlign: 'auto',
-                        color: color.text._100,
                         marginVertical: spacing.sm,
                         fontSize: getModifiedFontSize(14),
                     },
@@ -600,7 +574,6 @@ export namespace MarkdownStyle {
                     hardbreak: {
                         width: '100%',
                         height: 1,
-                        color: color.text._100,
                     },
                     softbreak: {},
 

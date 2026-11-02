@@ -1,12 +1,17 @@
-import { APIManager } from '@lib/engine/API/APIManagerState'
+import { useMMKVBoolean } from 'react-native-mmkv'
+
+import { AppSettings } from '@lib/constants/appSettings'
 import { Llama } from '@lib/engine/Local/LlamaLocal'
 import { useAppMode } from '@lib/state/AppMode'
+
+import { useActiveConnection } from './ActiveConnection'
 
 export const useActiveProvider = () => {
     const { appMode } = useAppMode()
     const { model } = Llama.useLlamaModelStore()
-    const { activeIndex } = APIManager.useConnectionsStore()
+    const { activeConnection } = useActiveConnection()
+    const [autoLoad] = useMMKVBoolean(AppSettings.AutoLoadLocal)
 
-    if (appMode === 'local') return { mode: 'local', available: !!model }
-    return { mode: 'remote', available: activeIndex !== -1 }
+    if (appMode === 'local') return { mode: 'local', available: !!model || autoLoad }
+    return { mode: 'remote', available: !!activeConnection }
 }

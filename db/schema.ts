@@ -1,6 +1,7 @@
 import { relations, sql } from 'drizzle-orm'
 import {
     check,
+    uniqueIndex,
     index,
     integer,
     primaryKey,
@@ -93,13 +94,11 @@ export const tagsRelations = relations(tags, ({ many }) => ({
     characters: many(characterTags),
 }))
 
-// for now, use strict naming convention for _index based stores
-// this is needed as removals require shifting all db values of [type_index] by -1
 export const linkTypes = [
     'user_id',
     'instruct_id',
-    'connection_index',
-    'sampler_index',
+    'connection_id',
+    'sampler_id',
     'model_id',
 ] as const
 
@@ -188,6 +187,101 @@ export const chatSwipes = sqliteTable(
     (table) => [index('chat_swipes_entry_active_idx').on(table.entry_id, table.active)]
 )
 
+// Coverage keeps historical IDs after source deletion so the summary remains reviewable.
+export type SummaryError = {
+    reason: 'output_limit' | 'cancelled' | 'failed'
+    message: string
+}
+
+export const chatSummaries = sqliteTable(
+    'chat_summaries',
+    {
+        id: integer('id').primaryKey({ autoIncrement: true }),
+        chat_id: integer('chat_id')
+            .notNull()
+            .references(() => chats.id, { onDelete: 'cascade' }),
+        content: text('content').notNull().default(''),
+        kind: text('kind', { enum: ['history', 'consolidation'] })
+            .notNull()
+            .default('history'),
+        status: text('status', { enum: ['draft', 'accepted', 'replaced', 'discarded'] })
+            .notNull()
+            .default('draft'),
+        /** @deprecated Summary usage is determined by status. */
+        enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
+        source_changed: integer('source_changed', { mode: 'boolean' }).notNull().default(false),
+        notice_dismissed: integer('notice_dismissed', { mode: 'boolean' }).notNull().default(false),
+        start_entry_id: integer('start_entry_id').notNull(),
+        end_entry_id: integer('end_entry_id').notNull(),
+        /** @deprecated Automatic regeneration no longer suppresses deleted ranges. */
+        eligible_end_id: integer('eligible_end_id').notNull().default(0),
+        replaces_id: integer('replaces_id'),
+        /** @deprecated Automatic continuation has no attempt counter. */
+        attempt_count: integer('attempt_count').notNull().default(0),
+        error: text('error', { mode: 'json' }).$type<SummaryError>(),
+        created_at: integer('created_at')
+            .notNull()
+            .$defaultFn(() => Date.now()),
+    },
+    (table) => [
+        index('chat_summaries_chat_status_idx').on(table.chat_id, table.status),
+        uniqueIndex('chat_summaries_one_draft_idx')
+            .on(table.chat_id)
+            .where(sql`${table.status} = 'draft'`),
+        index('chat_summaries_range_idx').on(
+            table.chat_id,
+            table.start_entry_id,
+            table.end_entry_id
+        ),
+    ]
+)
+
+export const summarySources = sqliteTable(
+    'summary_sources',
+    {
+        summary_id: integer('summary_id')
+            .notNull()
+            .references(() => chatSummaries.id, { onDelete: 'cascade' }),
+        entry_id: integer('entry_id').notNull(),
+        swipe_id: integer('swipe_id').notNull(),
+    },
+    (table) => [
+        primaryKey({ columns: [table.summary_id, table.entry_id] }),
+        index('summary_sources_entry_idx').on(table.entry_id),
+        index('summary_sources_swipe_idx').on(table.swipe_id),
+    ]
+)
+
+export const summaryInputs = sqliteTable(
+    'summary_inputs',
+    {
+        summary_id: integer('summary_id')
+            .notNull()
+            .references(() => chatSummaries.id, { onDelete: 'cascade' }),
+        source_summary_id: integer('source_summary_id')
+            .notNull()
+            .references(() => chatSummaries.id, { onDelete: 'cascade' }),
+    },
+    (table) => [
+        primaryKey({ columns: [table.summary_id, table.source_summary_id] }),
+        index('summary_inputs_source_idx').on(table.source_summary_id),
+    ]
+)
+
+export type ChatSummary = typeof chatSummaries.$inferSelect
+
+export const swipeReasoning = sqliteTable('swipe_reasoning', {
+    swipe_id: integer('swipe_id')
+        .primaryKey()
+        .references(() => chatSwipes.id, { onDelete: 'cascade' }),
+    content: text('content').notNull(),
+    reset_length: integer('reset_length'),
+})
+
+export const swipeReasoningRelations = relations(swipeReasoning, ({ one }) => ({
+    swipe: one(chatSwipes, { fields: [swipeReasoning.swipe_id], references: [chatSwipes.id] }),
+}))
+
 export const chatsRelations = relations(chats, ({ many, one }) => ({
     messages: many(chatEntries),
     character: one(characters, {
@@ -206,6 +300,7 @@ export const chatEntriesRelations = relations(chatEntries, ({ one, many }) => ({
 }))
 
 export const swipesRelations = relations(chatSwipes, ({ one }) => ({
+    reasoning: one(swipeReasoning),
     entry: one(chatEntries, {
         fields: [chatSwipes.entry_id],
         references: [chatEntries.id],
@@ -460,7 +555,9 @@ export const authorNotes = sqliteTable(
 )
 
 export type ModelDataType = typeof model_data.$inferSelect
-export type ChatSwipe = typeof chatSwipes.$inferSelect
+export type ChatSwipe = typeof chatSwipes.$inferSelect & {
+    reasoning?: typeof swipeReasoning.$inferSelect | null
+}
 export type ChatEntryType = typeof chatEntries.$inferSelect
 export type ChatType = typeof chats.$inferSelect
 export type ChatAttachmentType = typeof chatAttachments.$inferSelect

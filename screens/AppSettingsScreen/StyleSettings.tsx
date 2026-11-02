@@ -1,0 +1,56 @@
+import { useTranslation } from 'react-i18next'
+import { View } from 'react-native'
+import { useShallow } from 'zustand/react/shallow'
+
+import ThemedButton from '@components/buttons/ThemedButton'
+import Alert from '@components/views/Alert'
+import { useBackgroundStore } from '@lib/state/BackgroundImage'
+
+const StyleSettings = () => {
+    const { t } = useTranslation()
+
+    const { chatBackground, importBackground, deleteBackground } = useBackgroundStore(
+        useShallow((state) => ({
+            chatBackground: state.image,
+            importBackground: state.importImage,
+            deleteBackground: state.removeImage,
+        }))
+    )
+
+    return (
+        <View style={{ rowGap: 8 }}>
+            <ThemedButton
+                label={
+                    chatBackground
+                        ? t('settings.style.replaceBackground')
+                        : t('settings.style.importBackground')
+                }
+                variant="secondary"
+                onPress={importBackground}
+            />
+            {chatBackground && (
+                <ThemedButton
+                    label={t('settings.style.deleteBackground')}
+                    variant="secondary"
+                    onPress={() =>
+                        Alert.alert({
+                            title: t('settings.style.alert.deleteBackground.title'),
+                            description: t('settings.style.alert.deleteBackground.description'),
+                            buttons: [
+                                { label: t('common.actions.cancel') },
+                                {
+                                    label: t('settings.style.alert.deleteBackground.confirm'),
+                                    type: 'warning',
+                                    onPress: deleteBackground,
+                                },
+                            ],
+                        })
+                    }
+                    level="error"
+                />
+            )}
+        </View>
+    )
+}
+
+export default StyleSettings

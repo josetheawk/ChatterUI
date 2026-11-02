@@ -8,45 +8,48 @@ import { setBackgroundColorAsync as setUIBackgroundColor } from 'expo-system-ui'
 import { z } from 'zod'
 
 import { migrateData } from '@db/dataMigrations'
+import { observeModelDownloads } from '@lib/downloads/models'
 import { Model } from '@lib/engine/Local/Model'
 import { Tokenizer } from '@lib/engine/Tokenizer'
+import { useOnboardingStore } from '@lib/onboarding/store'
 import { setupNotifications } from '@lib/notifications/Notifications'
 import { useAppModeStore } from '@lib/state/AppMode'
 import { useChatInputTextStore } from '@lib/state/components/ChatInput'
 import { Instructs } from '@lib/state/Instructs'
-import { SamplersManager } from '@lib/state/SamplerState'
-import { useTTSStore } from '@lib/state/TTS'
+import { useSamplerStore } from '@lib/state/samplerStore'
+import { useTTSSettingsStore } from '@lib/tts/settingsStore'
 
 import { AppDirectory, deleteFile, listFiles, makeDirectory, readStringAsync } from './File'
 import { lockScreenOrientation } from './Screen'
-import { AppSettings, AppSettingsDefault, Global } from '../constants/GlobalValues'
+import { AppSettings, AppSettingsDefault } from '../constants/appSettings'
+import { Global } from '../constants/globalValues'
 import { Llama } from '../engine/Local/LlamaLocal'
-import { Characters } from '../state/Characters'
-import { Chats } from '../state/Chat'
+import { Characters } from '../state/characters'
+import { Chats } from '../state/chat'
 import { Logger } from '../state/Logger'
 import { mmkv } from '../storage/MMKV'
 import { Theme } from '../theme/ThemeManager'
 
 const loadNewestChat = async () => {
     Logger.info('Loading latest chat')
-    const newestChat = await Chats.db.query.chatNewest()
+    const newestChat = await Chats.db.query.latestChat()
     if (!newestChat) return
-    await Characters.useCharacterStore.getState().setCard(newestChat.character_id)
-    await Chats.useChatState.getState().setId(newestChat.id)
+    Characters.useCharacterState.getState().setCard(newestChat.character_id)
+    await Chats.actions.loadChat(newestChat.id)
 }
 
 export const loadChatOnInit = async () => {
     if (!mmkv.getBoolean(AppSettings.ChatOnStartup)) return
     await loadNewestChat()
-    router.push('/screens/ChatScreen')
+    router.push('/chat')
 }
 
 export const useTextIntentFocus = () => {
     return useTextIntentOnForeground(async (text) => {
-        if (!text) return
+        if (!text || useOnboardingStore.getState().status !== 'complete') return
         useChatInputTextStore.getState().setText(text)
         if (router.canDismiss()) router.dismissAll()
-        router.push('/screens/ChatScreen')
+        router.push('/chat')
         await loadNewestChat()
     }, [])
 }
@@ -65,9 +68,9 @@ const setAppDefaultSettings = () => {
 
 const createDefaultCard = async () => {
     if (!mmkv.getBoolean(AppSettings.CreateDefaultCard)) return
-    const result = await Characters.db.query.cardList('character')
-    if (result.length === 0) await Characters.createDefaultCard()
-    mmkv.set(AppSettings.CreateDefaultCard, false)
+    const result = await Characters.actions.createDefaultCard()
+    if (result.success) mmkv.set(AppSettings.CreateDefaultCard, false)
+    else Logger.error(result.error)
 }
 
 const setCPUFeatures = async () => {
@@ -113,11 +116,11 @@ const migrateTTSData_0_8_5_to_0_8_6 = () => {
     */
     if (mmkv.getBoolean('ttsauto')) {
         mmkv.remove('ttsauto')
-        useTTSStore.getState().setAuto(true)
+        useTTSSettingsStore.getState().setAuto(true)
     }
     if (mmkv.getBoolean('ttsenable')) {
         mmkv.remove('ttsenable')
-        useTTSStore.getState().setEnabled(true)
+        useTTSSettingsStore.getState().setEnabled(true)
     }
     const speakerData = mmkv.getString('ttsspeaker')
     if (speakerData) {
@@ -132,7 +135,7 @@ const migrateTTSData_0_8_5_to_0_8_6 = () => {
             })
             const result = voiceSchema.safeParse(voiceData)
             if (result.success) {
-                useTTSStore.getState().setVoice(voiceData)
+                useTTSSettingsStore.getState().setVoice(voiceData)
             } else throw new Error('Schema validation failed')
         } catch (e) {
             Logger.error('migrateTTSData_0_8_5_to_0_8_6 Failed')
@@ -143,9 +146,7 @@ const migrateTTSData_0_8_5_to_0_8_6 = () => {
 
 export const generateDefaultDirectories = async () => {
     // Removed: 'instruct', 'persona', 'presets', 'lorebooks'
-    Object.values(AppDirectory).map((dir) => {
-        makeDirectory(dir)
-    })
+    await Promise.all(Object.values(AppDirectory).map(makeDirectory))
 }
 
 const migratePresets_0_8_3_to_0_8_4 = async () => {
@@ -156,7 +157,7 @@ const migratePresets_0_8_3_to_0_8_4 = async () => {
     files.map(async (item) => {
         try {
             const data = await readStringAsync(`${presetPath}/${item}`)
-            SamplersManager.useSamplerStore.getState().addSamplerConfig({
+            useSamplerStore.getState().addSamplerConfig({
                 data: JSON.parse(data),
                 name: item.replace('.json', ''),
             })
@@ -188,12 +189,14 @@ const migrateTextIntent_0_8_8_to_0_8_9 = () => {
 }
 
 const createDefaultUserData = async () => {
-    const id = await Characters.db.mutate.createCard('User', 'user')
+    const id = await Characters.db.create.blankCard('User', { type: 'user' })
     Characters.useUserStore.getState().setCard(id)
 }
 
 const setDefaultUser = async () => {
-    const userList = await Characters.db.query.cardList('user')
+    if (!Characters.useUserStore.persist.hasHydrated())
+        await Characters.useUserStore.persist.rehydrate()
+    const userList = await Characters.db.query.cardList({ type: 'user' })
     if (!userList) {
         Logger.error(
             'User database is Invalid, this should not happen! Please report this occurence.'
@@ -237,23 +240,25 @@ const setCPUThreads = () => {
     mmkv.set(Global.CPUThreads, newThreads)
 }
 
-export const startupApp = () => {
+export const startupApp = async () => {
+    await migrateData()
     console.log('[APP STARTED]: T1APT')
     // DEV: Needed for Reset
     //Chats.useChatState.getState().reset()
-    //Characters.useCharacterCard.getState().unloadCard()
 
     // Sets default preferences
     setAppDefaultSettings()
-    generateDefaultDirectories()
-    setDefaultUser()
+    await generateDefaultDirectories()
+    // The default card now imports directly from its bundled Expo asset.
+    deleteFile(`${AppDirectory.Assets}aibot.png`)
+    await setDefaultUser()
     setDefaultInstruct()
 
     // setup notifications
     setupNotifications()
 
     // Initialize the default card
-    createDefaultCard()
+    await createDefaultCard()
 
     // get fp16, i8mm and dotprod data
     setCPUFeatures()
@@ -261,19 +266,16 @@ export const startupApp = () => {
     // set cpu thread count
     setCPUThreads()
 
-    // patch Android text for bold Accessibility, still an issue here:
-    // https://github.com/Vali-98/ChatterUI/issues/511
-    // patchAndroidText()
-
     // set keep awake settings
     setKeepAwake()
 
     // Local Model Data in case external models are deleted
     Model.verifyModelList()
+    observeModelDownloads()
     Tokenizer.useTokenizerState.getState().loadModel()
 
     // Fix any missing samplers
-    SamplersManager.useSamplerStore.getState().fixConfigs()
+    useSamplerStore.getState().fixConfigs()
 
     // migrations for old versions
     migrateModelData_0_7_10_to_0_8_0()
@@ -283,9 +285,13 @@ export const startupApp = () => {
     migrateAppMode_0_8_5_to_0_8_6()
     migrateTextIntent_0_8_8_to_0_8_9()
     lockScreenOrientation()
-    migrateData()
-    const backgroundColor = Theme.useColorState.getState().color.neutral._100
+    const themeState = Theme.useColorState.getState()
+    const backgroundColor = Theme.resolveColor(themeState.colorName, themeState.customColors)
+        .neutral._100
     setUIBackgroundColor(backgroundColor)
 
     Logger.info('Resetting state values for startup.')
+    // note, there is an ancient RN bug where bold text accessibilty breaks
+    // text rendering, keep this in mind:
+    // https://github.com/react/react-native/issues/53666#issuecomment-3357502528
 }

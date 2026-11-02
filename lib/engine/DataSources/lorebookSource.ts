@@ -1,9 +1,11 @@
 import { addDatabaseChangeListener } from 'expo-sqlite'
 
 import { LorebookEntryType, LorebookType } from '@db/schema'
-import { Tokenizer } from '@lib/engine/Tokenizer'
 import { Lorebooks } from '@lib/state/lorebooks'
-import { useLorebookPreferenceStore } from '@lib/state/lorebooks/state'
+import {
+    useLorebookPreferenceStore,
+    type LorebookPreferenceStore,
+} from '@lib/state/lorebooks/state'
 import { replaceMacros } from '@lib/state/Macros'
 
 import { DataSource, DataSourceResult } from './types'
@@ -14,7 +16,6 @@ const MAX_CACHE_LIFETIME = 5
 type LorebookEntryCacheItem = {
     primaryKey: RegExp
     secondaryKey: RegExp
-    tokenCount: number
     searchTime: number
 }
 
@@ -33,7 +34,6 @@ class LorebookEntryCache {
         const item: LorebookEntryCacheItem = {
             primaryKey: createKeyRegex(entry.keys, entry.case_sensitive),
             secondaryKey: createKeyRegex(entry.secondary_keys, entry.case_sensitive),
-            tokenCount: await Tokenizer.getTokenizer()(entry.content),
             searchTime: this.lifetime,
         }
 
@@ -138,18 +138,17 @@ const sortEntries = (entries: MatchedEntry[]) => {
     })
 }
 
-const getSingleLorebookSource = async (lorebook: LorebookType): Promise<DataSource | undefined> => {
+const getSingleLorebookSource = async (
+    lorebook: LorebookType,
+    preferences: Pick<LorebookPreferenceStore, 'insertionLocation' | 'insertionDepth'>
+): Promise<DataSource | undefined> => {
     const entries = await Lorebooks.db.query.lorebookEntryList(lorebook.id)
 
     const enabledEntries = entries.filter((entry) => entry.enable)
 
     if (enabledEntries.length === 0) return
 
-    const getTokenLength = async (entry: NonNullable<LorebookEntryType>): Promise<number> => {
-        const cached = (await lorebookEntryCache.get(entry)).tokenCount
-        return cached
-    }
-
+    const { insertionLocation, insertionDepth } = preferences
     return {
         name: LOREBOOK_NAME,
         priority: 2,
@@ -169,10 +168,8 @@ const getSingleLorebookSource = async (lorebook: LorebookType): Promise<DataSour
             maxLength,
             currentLength,
             _tokenBudget,
-            lastMessageReached
+            _lastMessageReached
         ) => {
-            if (!lastMessageReached) return []
-
             const configuredBudget = lorebook.token_budget ?? 0
 
             if (configuredBudget <= 0) return []
@@ -207,8 +204,10 @@ const getSingleLorebookSource = async (lorebook: LorebookType): Promise<DataSour
 
                 matchedEntries.push({
                     entry: entry,
-                    content: replaceMacros(entry.content),
-                    tokenLength: await getTokenLength(entry),
+                    content: replaceMacros(entry.content, params.macros),
+                    tokenLength: await params.tokenizer(
+                        `**${entry.name}**: ${replaceMacros(entry.content, params.macros)}`
+                    ),
                     discoveryOrder: discoveryOrder++,
                 })
             }
@@ -264,7 +263,6 @@ const getSingleLorebookSource = async (lorebook: LorebookType): Promise<DataSour
 
             sortEntries(selected)
 
-            const { insertionLocation, insertionDepth } = useLorebookPreferenceStore.getState()
             const position: DataSourceResult['position'] =
                 insertionLocation === 'index'
                     ? {
@@ -286,13 +284,14 @@ const getSingleLorebookSource = async (lorebook: LorebookType): Promise<DataSour
 }
 
 const createLorebookDataSource = async () => {
+    const preferences = { ...useLorebookPreferenceStore.getState() }
     lorebookEntryCache.collect()
 
     const output: DataSource[] = []
     const lorebooks = await Lorebooks.db.query.activeLorebooks()
 
     for (const lorebook of lorebooks) {
-        const lorebookSource = await getSingleLorebookSource(lorebook)
+        const lorebookSource = await getSingleLorebookSource(lorebook, preferences)
         if (lorebookSource) {
             output.push(lorebookSource)
         }

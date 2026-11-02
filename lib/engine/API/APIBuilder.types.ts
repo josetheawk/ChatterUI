@@ -38,6 +38,8 @@ export interface APIFeatures {
     usePrefill: boolean
     useFirstMessage: boolean
     useKey: boolean
+    // A key is optional unless explicitly required.
+    keyRequired?: boolean
     useModel: boolean
     multipleModels: boolean
 }
@@ -62,6 +64,7 @@ export interface APIRequestFormat {
               contentName: string
               supportsAudio?: boolean
               supportsImages?: boolean
+              endWithUserTurn?: boolean
           }
         | { type: 'textCompletions' }
     // key for the authorization header
@@ -71,6 +74,7 @@ export interface APIRequestFormat {
     // how we get data out of the response stream, eg data.content.delta.text
     responseParsePattern: string
     // how we get data out of the reasoning stream, eg data.content.reason.text
+    // Receive-only. TODO: Templates must explicitly describe native reasoning replay before it is sent.
     reasoningParsePattern?: string | string[]
     // whether or not to remove the max_length field
     removeLength: boolean
